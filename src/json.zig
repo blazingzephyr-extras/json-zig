@@ -18,6 +18,7 @@ const parser_mod = @import("parser.zig");
 const stream_mod = @import("stream.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const value_mod = @import("value.zig");
+const annotation_mod = @import("annotation.zig");
 
 /// Lossless document model: parse, edit, emit byte-identical when
 /// unmodified. See `src/document.zig`.
@@ -55,6 +56,11 @@ pub const Diagnostic = parser_mod.Diagnostic;
 
 /// All knobs for `parse`. Default is `.{}` (strict JSON, depth 128).
 pub const ParseOptions = parser_mod.ParseOptions;
+
+/// Type annotation.
+pub const TypeAnnotationProvider = annotation_mod.TypeAnnotationProvider;
+pub const TypeAnnotationOptions = annotation_mod.TypeAnnotationOptions;
+pub const DefaultTypeAnnotation = annotation_mod.DefaultTypeAnnotation;
 
 /// Number materialization policy for the dynamic `Value` tree. `.typed`
 /// (default) yields `.integer`/`.float`; `.raw` yields `.number_raw` with
@@ -139,8 +145,8 @@ pub const DecodeError = decode_mod.DecodeError;
 /// use `number_mode = .raw` so the lexeme decodes directly into the
 /// target. JSON `null` decodes only into optional targets; anywhere else
 /// it errors like an absent field. See `src/decode.zig`.
-pub fn decode(comptime T: type, arena: std.mem.Allocator, value: Value, options: ParseOptions) DecodeError!T {
-    return decode_mod.decode(T, arena, value, options);
+pub fn decode(comptime T: type, comptime TAnnotation: type, arena: std.mem.Allocator, value: Value, options: ParseOptions) DecodeError!T {
+    return decode_mod.decode(T, TAnnotation, arena, value, options);
 }
 
 /// Decode `src` directly into a `T`. Types without `Value` fields,
@@ -150,14 +156,14 @@ pub fn decode(comptime T: type, arena: std.mem.Allocator, value: Value, options:
 /// identically. All allocations land in `arena`; string fields may be
 /// zero-copy slices into `src`, so keep `src` alive while the result is
 /// in use.
-pub fn parseInto(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) (Error || DecodeError)!T {
-    return decode_mod.parseInto(T, arena, src, options);
+pub fn parseInto(comptime T: type, comptime TAnnotation: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) (Error || DecodeError)!T {
+    return decode_mod.parseInto(T, TAnnotation, arena, src, options);
 }
 
 /// Reader-input variant of `parseInto`: drains the reader into arena
 /// memory, then parses and decodes.
-pub fn parseIntoReader(comptime T: type, arena: std.mem.Allocator, reader: *std.Io.Reader, options: ParseOptions) (ReaderError || DecodeError)!T {
-    return decode_mod.parseIntoReader(T, arena, reader, options);
+pub fn parseIntoReader(comptime T: type, comptime TAnnotation: type, arena: std.mem.Allocator, reader: *std.Io.Reader, options: ParseOptions) (ReaderError || DecodeError)!T {
+    return decode_mod.parseIntoReader(T, TAnnotation, arena, reader, options);
 }
 
 /// Encode failure: writer errors, plus `UnrepresentableFloat` for NaN
