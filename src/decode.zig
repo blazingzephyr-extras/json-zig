@@ -117,17 +117,18 @@ pub fn validateAnnotations(comptime T: type) void {
 /// Returns the effective JSON key for `field_name` on type `T`,
 /// consulting `T.json_rename` if present.
 pub fn renamedKey(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) []const u8 {
-    const renames = if (TAnnotation.getOrEmpty(T)) |annotation| {
-        if (annotation.json_renames) |renames| {
-            renames;
+    const renames = blk: {
+        if (TAnnotation.getOrEmpty(T)) |annotation| {
+            if (annotation.json_rename) |renames| break :blk renames;
         }
-    } else if (@hasDecl(T, "json_rename"))
-        T.json_rename
-    else
-        return field_name;
+        if (@hasDecl(T, "json_rename")) break :blk T.json_rename;
+        break :blk null;
+    };
 
-    if (@hasField(@TypeOf(renames), field_name)) {
-        return @field(renames, field_name);
+    if (renames) |r| {
+        if (@hasField(@TypeOf(r), field_name)) {
+            return @field(r, field_name);
+        }
     }
     return field_name;
 }
@@ -267,7 +268,7 @@ fn decodeInner(comptime T: type, comptime TAnnotation: type, arena: Allocator, v
     }
 
     // Tagged-union dispatch.
-    if (comptime (@typeInfo(T) == .@"union" and (@hasDecl(T, "json_tag") or (TAnnotation.has(T) and TAnnotation.get(T).json_tag)))) {
+    if (comptime (@typeInfo(T) == .@"union" and (@hasDecl(T, "json_tag") or (TAnnotation.has(T) and TAnnotation.get(T).json_tag != null)))) {
         return decodeTaggedUnion(T, TAnnotation, arena, value, options, path);
     }
 
@@ -527,9 +528,9 @@ fn decodeTaggedUnion(comptime T: type, comptime TAnnotation: type, arena: Alloca
     }
     const obj = value.object;
 
-    const tag_field = if (TAnnotation.getOrEmpty(T)) |annotation| {
+    const tag_field = if (TAnnotation.getOrEmpty(T)) |annotation| block: {
         if (annotation.json_tag) |json_tag| {
-            json_tag;
+            break :block json_tag;
         }
     } else T.json_tag;
 

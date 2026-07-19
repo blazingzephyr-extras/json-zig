@@ -13,18 +13,21 @@ const Value = v.Value;
 /// Currently supports structs and tagged unions.
 pub fn TypeAnnotationProvider(comptime T: type) type {
     return struct {
+        ///
+        pub const annotation_type: type = T;
+
         /// Name overrides.
-        json_rename: ?type,
+        json_rename: ?type = null,
         /// Sub-fields are decoded from the parent object
-        json_flatten: ?[]const []const u8,
+        json_flatten: ?[]const []const u8 = null,
         /// Excluded from decode/encode.
-        json_skip: ?[]const []const u8,
+        json_skip: ?[]const []const u8 = null,
         /// Custom deserialization of T,
-        fromJson: ?*const fn (arena: Allocator, value: Value, options: ParseOptions) DecodeError!T,
+        fromJson: ?*const fn (arena: Allocator, value: Value, options: ParseOptions) DecodeError!T = null,
         /// Custom serialization of T,
-        toJson: ?*const fn (self: T, arena: Allocator) Allocator.Error!Value,
+        toJson: ?*const fn (self: T, arena: Allocator) Allocator.Error!Value = null,
         /// Discriminator member for tagged unions,
-        json_tag: ?[]const u8,
+        json_tag: ?[]const u8 = null,
     };
 }
 
@@ -41,31 +44,34 @@ pub const DefaultTypeAnnotation = TypeAnnotationOptions(.{});
 /// 3. Allow to overwrite default annotation.
 pub fn TypeAnnotationOptions(comptime options: anytype) type {
     comptime {
-        for (options) |type_annotation| {
-            if (type_annotation.len < 2) break;
+        for (options) |annotation_entry| {
+            const TOption = @TypeOf(annotation_entry);
+            if (!@hasDecl(TOption, "annotation_type")) break;
+            if (!@hasField(TOption, "json_rename")) break;
+            if (!@hasField(TOption, "json_flatten")) break;
+            if (!@hasField(TOption, "json_skip")) break;
+            if (!@hasField(TOption, "fromJson")) break;
+            if (!@hasField(TOption, "toJson")) break;
+            if (!@hasField(TOption, "json_tag")) break;
 
-            const T = type_annotation[0];
-            const annotation = type_annotation[1];
-            if (@TypeOf(T) != type) break;
-            if (@TypeOf(annotation) != TypeAnnotationProvider(T)) break;
-
+            const T = TOption.annotation_type;
             const kind = if (@typeInfo(T) == .@"union") "variant" else "field";
-            if (annotation.json_rename) {
-                for (annotation.json_rename.fields) |rf| {
+            if (annotation_entry.json_rename) |rename| {
+                for (rename.fields) |rf| {
                     if (!@hasField(T, rf.name)) {
                         @compileError("json_rename entry `" ++ rf.name ++ "` does not match any " ++ kind ++ " of " ++ @typeName(T));
                     }
                 }
             }
-            if (annotation.json_skip) {
-                for (annotation.json_skip) |name| {
+            if (annotation_entry.json_skip) |skip| {
+                for (skip) |name| {
                     if (!@hasField(T, name)) {
                         @compileError("json_skip entry `" ++ name ++ "` does not match any " ++ kind ++ " of " ++ @typeName(T));
                     }
                 }
             }
-            if (annotation.json_flatten) {
-                for (annotation.json_flatten) |name| {
+            if (annotation_entry.json_flatten) |flatten| {
+                for (flatten) |name| {
                     if (!@hasField(T, name)) {
                         @compileError("json_flatten entry `" ++ name ++ "` does not match any " ++ kind ++ " of " ++ @typeName(T));
                     }
@@ -76,25 +82,28 @@ pub fn TypeAnnotationOptions(comptime options: anytype) type {
 
             /// Determines whether an entry for T exists.
             pub fn has(comptime T: type) bool {
-                return inline for (annotation) |entry| {
-                    if (entry[0] == T) break true;
+                return inline for (annotation) |annotation_entry| {
+                    const TOption = @TypeOf(annotation_entry);
+                    if (TOption.annotation_type == T) break true;
                 } else false;
             }
 
             /// Retrieves entry for T.
             pub fn get(comptime T: type) TypeAnnotationProvider(T) {
-                inline for (annotation) |entry| {
-                    if (entry[0] == T) return entry[1];
+                inline for (annotation) |annotation_entry| {
+                    const TOption = @TypeOf(annotation_entry);
+                    if (TOption.annotation_type == T) return annotation_entry;
                 } else @compileError("Annotation registry lacks entry for " ++ T ++ ".");
             }
 
             pub fn getOrEmpty(comptime T: type) ?TypeAnnotationProvider(T) {
-                return inline for (annotation) |entry| {
-                    if (entry[0] == T) break entry[1];
+                return inline for (annotation) |annotation_entry| {
+                    const TOption = @TypeOf(annotation_entry);
+                    if (TOption.annotation_type == T) break annotation_entry;
                 } else null;
             }
         };
 
-        @compileError("Type annotation should be exactly (Type, TypeAnnotationProvider(T) instance)");
+        @compileError("Type annotation should be exactly a TypeAnnotationProvider(T) instance.");
     }
 }
