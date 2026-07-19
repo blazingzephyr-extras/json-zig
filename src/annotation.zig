@@ -20,9 +20,9 @@ pub fn TypeAnnotationProvider(comptime T: type) type {
         /// Excluded from decode/encode.
         json_skip: ?[]const []const u8,
         /// Custom deserialization of T,
-        fromJson: *const fn (arena: Allocator, value: Value, options: ParseOptions) DecodeError!T,
+        fromJson: ?*const fn (arena: Allocator, value: Value, options: ParseOptions) DecodeError!T,
         /// Custom serialization of T,
-        toJson: *const fn (self: T, arena: Allocator) Allocator.Error!Value,
+        toJson: ?*const fn (self: T, arena: Allocator) Allocator.Error!Value,
         /// Discriminator member for tagged unions,
         json_tag: ?[]const u8,
     };

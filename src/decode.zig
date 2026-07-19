@@ -267,7 +267,7 @@ fn decodeInner(comptime T: type, comptime TAnnotation: type, arena: Allocator, v
     }
 
     // Tagged-union dispatch.
-    if (comptime (@typeInfo(T) == .@"union" and (@hasDecl(T, "json_tag") || TAnnotation.getOrEmpty(T).json_tag))) {
+    if (comptime (@typeInfo(T) == .@"union" and (@hasDecl(T, "json_tag") or (TAnnotation.has(T) and TAnnotation.get(T).json_tag)))) {
         return decodeTaggedUnion(T, TAnnotation, arena, value, options, path);
     }
 
