@@ -57,7 +57,7 @@ pub fn TypeAnnotationOptions(comptime options: anytype) type {
             const T = TOption.annotation_type;
             const kind = if (@typeInfo(T) == .@"union") "variant" else "field";
             if (annotation_entry.json_rename) |rename| {
-                for (rename.fields) |rf| {
+                for (@typeInfo(rename).@"struct".fields) |rf| {
                     if (!@hasField(T, rf.name)) {
                         @compileError("json_rename entry `" ++ rf.name ++ "` does not match any " ++ kind ++ " of " ++ @typeName(T));
                     }

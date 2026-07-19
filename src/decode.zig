@@ -117,22 +117,20 @@ pub fn validateAnnotations(comptime T: type) void {
 /// Returns the effective JSON key for `field_name` on type `T`,
 /// consulting `T.json_rename` if present.
 pub fn renamedKey(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) []const u8 {
-    const renames = blk: {
-        if (TAnnotation.getOrEmpty(T)) |annotation| {
-            if (annotation.json_rename) |renames| break :blk renames;
+    if (TAnnotation.getOrEmpty(T)) |annotation| {
+        if (annotation.json_rename) |r| {
+            if (@hasField(@TypeOf(r), field_name)) return @field(r, field_name);
+            return field_name;
         }
-        if (@hasDecl(T, "json_rename")) break :blk T.json_rename;
-        break :blk null;
-    };
-
-    if (renames) |r| {
-        if (@hasField(@TypeOf(r), field_name)) {
-            return @field(r, field_name);
-        }
+    }
+    if (@hasDecl(T, "json_rename")) {
+        const r = T.json_rename;
+        if (@hasField(@TypeOf(r), field_name)) return @field(r, field_name);
     }
     return field_name;
 }
 
+/// TODO
 /// Returns true if `field_name` on type `T` is listed in `T.json_skip`.
 pub fn isSkipped(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) bool {
     const skip = if (TAnnotation.getOrEmpty(T)) |annotation| {
@@ -150,6 +148,7 @@ pub fn isSkipped(comptime T: type, comptime TAnnotation: type, comptime field_na
     return false;
 }
 
+/// TODO
 /// Returns true if `field_name` on type `T` is listed in `T.json_flatten`.
 pub fn isFlattened(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) bool {
     const flat = if (TAnnotation.getOrEmpty(T)) |annotation| {
