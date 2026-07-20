@@ -1,4 +1,12 @@
-//! Type annotation utilities.
+//! Type annotation utilities for typed encoding and decoding.
+//!
+//! Reasoning:
+//! 1. Adding metadata to types from other packages;
+//! 2. Support comptime-generated types from @Struct and @Union, where
+//! embedding annotations by declaring fields is currently impossible /
+//! undesirable behavior;
+//! 3. Allow to overwrite default annotations for specific files when needed.
+
 const std = @import("std");
 const decode = @import("decode.zig");
 const parser = @import("parser.zig");
@@ -13,7 +21,7 @@ const Value = v.Value;
 /// Currently supports structs and tagged unions.
 pub fn TypeAnnotationProvider(comptime T: type) type {
     return struct {
-        ///
+        /// Type this provider annotates.
         pub const associated_type: type = T;
 
         /// Name overrides.
@@ -32,16 +40,38 @@ pub fn TypeAnnotationProvider(comptime T: type) type {
 }
 
 /// Default, empty type annotation registry.
-/// Types will be decoded using internal annotation options.
-pub const DefaultTypeAnnotation = TypeAnnotationOptions(.{});
+/// Types are decoded using only their own declarations.
+pub const DefaultTypes = TypeAnnotationOptions(.{});
 
 /// Constructs annotation options for typed encoding and decoding.
-/// Reasoning:
-/// 1. Support types from other packages;
-/// 2. Support compile-time generated types from @Struct and @Union, where
-/// embedding annotations by declaring fields is currently impossible /
-/// undesirable behavior;
-/// 3. Allow to overwrite default annotation.
+// Usage:
+// ```zig
+// fn ComponentUnion(comptime container: []const u8, comptime specs: anytype) type {
+//     var field_names: [specs.len][]const u8 = undefined;
+//     var field_types: [specs.len]type = undefined;
+//     var field_attrs: [specs.len]FieldAttributes = undefined;
+//     ...
+//     const Tag = ComponentEnum(container, specs);
+//     return @Union(.auto, Tag, &field_names, &field_types, &field_attrs);
+// }
+//
+// const _CardDescriptor: json.TypeAnnotationProvider(card_descriptor.CardDescriptor) = .{
+//     .json_rename = struct {
+//         pub const abilities = "special_abilities";
+//         pub const extra_tags = "tags";
+//     },
+//     .json_skip = &[_][]const u8{ ... },
+//     };
+// const _Component: json.TypeAnnotationProvider(Component) = .{ .json_tag = "$type" };
+// const _EffectEntityComponent: json.TypeAnnotationProvider(EffectEntityComponent) = .{ .json_tag = "$type" };
+// const _Query: json.TypeAnnotationProvider(Query) = .{
+//     .json_tag = "$type",
+//     .json_rename = struct {
+//         pub const AlwaysMatches = "AlwaysMatchesQuery";
+//     },
+// };
+// pub const ComponentUnionRegistry = json.TypeAnnotationOptions(.{ _CardDescriptor, _Component, ..., _Query });
+// ```
 pub fn TypeAnnotationOptions(comptime options: anytype) type {
     comptime {
         for (options) |annotation_entry| {

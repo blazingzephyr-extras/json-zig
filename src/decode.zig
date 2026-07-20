@@ -15,7 +15,7 @@
 //!     },
 //! };
 //!
-//! const cfg = try json.parseInto(Config, arena, src, .{});
+//! const cfg = try json.parseInto(Config, json.DefaultTypes, arena, src, .{});
 //! ```
 //!
 //! Field defaults satisfy missing-field cases. Optional fields (`?T`) become
@@ -87,6 +87,9 @@ const PathBuilder = struct {
 /// `@compileError` instead of silently never applying. Runs at the top of
 /// struct and tagged-union decoding (and typed encoding). Compile errors
 /// cannot be asserted from the test suite.
+///
+/// This does not TypeAnnotationProviders, because they are validated
+/// on creation during comptime.
 pub fn validateAnnotations(comptime T: type) void {
     comptime {
         const kind = if (@typeInfo(T) == .@"union") "variant" else "field";
@@ -115,25 +118,26 @@ pub fn validateAnnotations(comptime T: type) void {
 }
 
 /// Returns the effective JSON key for `field_name` on type `T`,
-/// consulting `T.json_rename` if present.
+/// consulting `T.json_rename` or `TAnnotation.json_rename` if present.
 pub fn renamedKey(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) []const u8 {
-    if (TAnnotation.getOrEmpty(T)) |annotation| {
-        if (annotation.json_rename) |r| {
+    if (TAnnotation.getOrEmpty(T)) |a| {
+        if (a.json_rename) |r| {
             if (@hasDecl(r, field_name)) return @field(r, field_name);
         }
     }
     if (@hasDecl(T, "json_rename")) {
         const r = T.json_rename;
-        if (@hasField(r, field_name)) return @field(r, field_name);
+        if (@hasField(@TypeOf(r), field_name)) return @field(r, field_name);
     }
     return field_name;
 }
 
-/// Returns true if `field_name` on type `T` is listed in `T.json_skip`.
+/// Returns true if `field_name` on type `T` is listed in `T.json_skip`
+/// or `TAnnotation.json_skip`.
 pub fn isSkipped(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) bool {
     const skip = blk: {
-        if (TAnnotation.getOrEmpty(T)) |annotation| {
-            break :blk annotation.json_skip orelse &[_][]const u8{};
+        if (TAnnotation.getOrEmpty(T)) |a| {
+            break :blk a.json_skip orelse &[_][]const u8{};
         }
         if (@hasDecl(T, "json_skip")) break :blk T.json_skip;
         break :blk &[_][]const u8{};
@@ -145,11 +149,12 @@ pub fn isSkipped(comptime T: type, comptime TAnnotation: type, comptime field_na
     return false;
 }
 
-/// Returns true if `field_name` on type `T` is listed in `T.json_flatten`.
+/// Returns true if `field_name` on type `T` is listed in `T.json_flatten`
+/// or `TAnnotation.json_flatten`.
 pub fn isFlattened(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) bool {
     const flat = blk: {
-        if (TAnnotation.getOrEmpty(T)) |annotation| {
-            break :blk annotation.json_flatten orelse &[_][]const u8{};
+        if (TAnnotation.getOrEmpty(T)) |a| {
+            break :blk a.json_flatten orelse &[_][]const u8{};
         }
         if (@hasDecl(T, "json_flatten")) break :blk T.json_flatten;
         break :blk &[_][]const u8{};
@@ -221,9 +226,9 @@ fn parseIntoTree(comptime T: type, comptime TAnnotation: type, arena: Allocator,
 
 /// Reader-input variant of `parseInto`: drains the reader into arena
 /// memory, then decodes the slice (streaming when the type allows).
-pub fn parseIntoReader(comptime T: type, arena: Allocator, reader: *std.Io.Reader, options: parser_mod.ParseOptions) (parser_mod.ReaderError || DecodeError)!T {
+pub fn parseIntoReader(comptime T: type, comptime TAnnotation: type, arena: Allocator, reader: *std.Io.Reader, options: parser_mod.ParseOptions) (parser_mod.ReaderError || DecodeError)!T {
     const input = try reader.allocRemaining(arena, .unlimited);
-    return parseInto(T, arena, input, options);
+    return parseInto(T, TAnnotation, arena, input, options);
 }
 
 fn decodeInner(comptime T: type, comptime TAnnotation: type, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
@@ -522,8 +527,8 @@ fn decodeTaggedUnion(comptime T: type, comptime TAnnotation: type, arena: Alloca
     }
     const obj = value.object;
 
-    const tag_field = if (TAnnotation.getOrEmpty(T)) |annotation| block: {
-        if (annotation.json_tag) |json_tag| {
+    const tag_field = if (TAnnotation.getOrEmpty(T)) |a| block: {
+        if (a.json_tag) |json_tag| {
             break :block json_tag;
         }
         break :block T.json_tag;
@@ -628,8 +633,8 @@ fn needsTreeImpl(comptime T: type, comptime TAnnotation: type, comptime seen: []
         return switch (@typeInfo(T)) {
             .@"struct" => |s| blk: {
                 if (@hasDecl(T, "fromJson")) break :blk true;
-                if (TAnnotation.getOrEmpty(T)) |annotation| {
-                    if (annotation.fromJson) break :blk true;
+                if (TAnnotation.getOrEmpty(T)) |a| {
+                    if (a.fromJson) break :blk true;
                 }
 
                 for (s.fields) |f| {
@@ -899,3 +904,765 @@ fn streamStruct(comptime T: type, comptime TAnnotation: type, p: *parser_mod.Par
 }
 
 const parse = @import("parser.zig").parse;
+const annotation = @import("annotation.zig");
+const DefaultTypes = annotation.DefaultTypes;
+
+test "decode struct with defaults optionals slices enums" {
+    const Config = struct {
+        title: []const u8,
+        port: u16 = 8080,
+        nick: ?[]const u8,
+        ratio: f64,
+        tags: []const []const u8,
+        mode: enum { fast, slow },
+        server: struct { host: []const u8, tls: bool = false },
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const cfg = try parseInto(Config, DefaultTypes, ar.allocator(),
+        \\{"title":"t","nick":null,"ratio":1.5,"tags":["a"],"mode":"fast",
+        \\ "server":{"host":"h"}}
+    , .{});
+    try std.testing.expectEqual(@as(u16, 8080), cfg.port);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.nick);
+    try std.testing.expectEqual(@as(f64, 1.5), cfg.ratio);
+    try std.testing.expectEqual(false, cfg.server.tls);
+}
+
+test "unknown field errors with did-you-mean; opt-out flag" {
+    const C = struct { port: u16 = 1 };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try std.testing.expectError(error.UnknownField, parseInto(C, DefaultTypes, a, "{\"prot\":2}", .{}));
+    const c = try parseInto(C, DefaultTypes, a, "{\"prot\":2}", .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqual(@as(u16, 1), c.port);
+}
+
+test "int overflow checked" {
+    const C = struct { n: u8 };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    try std.testing.expectError(error.Overflow, parseInto(C, DefaultTypes, ar.allocator(), "{\"n\":256}", .{}));
+}
+
+test "json_rename json_skip json_flatten" {
+    const C = struct {
+        pub const json_rename = .{ .listen_addr = "listen-addr" };
+        pub const json_skip = .{"runtime"};
+        pub const json_flatten = .{"common"};
+        listen_addr: []const u8,
+        runtime: u32 = 7,
+        common: struct { verbose: bool = false },
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"listen-addr\":\"x\",\"verbose\":true}", .{});
+    try std.testing.expectEqualStrings("x", c.listen_addr);
+    try std.testing.expectEqual(@as(u32, 7), c.runtime);
+    try std.testing.expectEqual(true, c.common.verbose);
+}
+
+test "json_tag tagged union" {
+    const Plugin = union(enum) {
+        pub const json_tag = "kind";
+        http: struct { port: u16 },
+        exec: struct { cmd: []const u8 },
+    };
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const p_ = try parseInto(Plugin, DefaultTypes, ar.allocator(), "{\"kind\":\"http\",\"port\":80}", .{});
+    try std.testing.expectEqual(@as(u16, 80), p_.http.port);
+}
+
+test "parseIntoReader decodes from a reader" {
+    const C = struct { port: u16 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var r: std.Io.Reader = .fixed("{\"port\":8080}");
+    const c = try parseIntoReader(C, DefaultTypes, ar.allocator(), &r, .{});
+    try testing.expectEqual(@as(u16, 8080), c.port);
+}
+
+test "decode null into non-optional field is MissingField" {
+    const C = struct { n: u32 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectError(error.MissingField, parseInto(C, DefaultTypes, ar.allocator(), "{\"n\":null}", .{}));
+}
+
+test "decode null/optional matrix" {
+    const C = struct {
+        a: ?u32, // present as null
+        b: ?u32, // absent
+        c: ?u32, // present with value
+        d: u32 = 5, // absent, has default
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"a\":null,\"c\":3}", .{});
+    try testing.expectEqual(@as(?u32, null), c.a);
+    try testing.expectEqual(@as(?u32, null), c.b);
+    try testing.expectEqual(@as(?u32, 3), c.c);
+    try testing.expectEqual(@as(u32, 5), c.d);
+}
+
+test "decode float field accepts integer value" {
+    const C = struct { x: f32, y: f64 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"x\":3,\"y\":-7}", .{});
+    try testing.expectEqual(@as(f32, 3.0), c.x);
+    try testing.expectEqual(@as(f64, -7.0), c.y);
+}
+
+test "decode int field rejects float value" {
+    const C = struct { n: u32 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectError(error.TypeMismatch, parseInto(C, DefaultTypes, a, "{\"n\":1.5}", .{}));
+    // 1e2 lexes as .float and stays one; it never decodes into an int.
+    try testing.expectError(error.TypeMismatch, parseInto(C, DefaultTypes, a, "{\"n\":1e2}", .{}));
+}
+
+test "decode int and float fields in raw number mode" {
+    const C = struct { n: u32, x: f64, big: i64 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const c = try parseInto(C, DefaultTypes, a, "{\"n\":42,\"x\":1.5,\"big\":9000000000}", .{ .number_mode = .raw });
+    try testing.expectEqual(@as(u32, 42), c.n);
+    try testing.expectEqual(@as(f64, 1.5), c.x);
+    try testing.expectEqual(@as(i64, 9000000000), c.big);
+
+    // Raw mode keeps typed-mode's policy: a float lexeme is not an int,
+    // and an out-of-range integer lexeme overflows.
+    const D = struct { n: u32 };
+    try testing.expectError(error.TypeMismatch, parseInto(D, DefaultTypes, a, "{\"n\":1.5}", .{ .number_mode = .raw }));
+    try testing.expectError(error.TypeMismatch, parseInto(D, DefaultTypes, a, "{\"n\":1e2}", .{ .number_mode = .raw }));
+    try testing.expectError(error.Overflow, parseInto(D, DefaultTypes, a, "{\"n\":99999999999}", .{ .number_mode = .raw }));
+}
+
+test "decode enum from integer tag" {
+    const Level = enum(u8) { debug = 0, info = 1, warn = 2, err = 3 };
+    const C = struct { level: Level };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"level\":2}", .{});
+    try testing.expectEqual(Level.warn, c.level);
+}
+
+test "decode enum from out-of-range integer is error" {
+    const Level = enum(u8) { debug = 0, info = 1 };
+    const C = struct { level: Level };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectError(error.InvalidEnumValue, parseInto(C, DefaultTypes, ar.allocator(), "{\"level\":99}", .{}));
+}
+
+test "decode enum from invalid string is error" {
+    const C = struct { mode: enum { fast, slow } };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectError(error.InvalidEnumValue, parseInto(C, DefaultTypes, ar.allocator(), "{\"mode\":\"warp\"}", .{}));
+}
+
+test "decode missing required field is error" {
+    const C = struct { required: []const u8 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectError(error.MissingField, parseInto(C, DefaultTypes, ar.allocator(), "{}", .{}));
+}
+
+test "decode fixed-size array and length mismatch" {
+    const C = struct { rgb: [3]u8 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const c = try parseInto(C, DefaultTypes, a, "{\"rgb\":[1,2,3]}", .{});
+    try testing.expectEqual(@as(u8, 1), c.rgb[0]);
+    try testing.expectEqual(@as(u8, 3), c.rgb[2]);
+    try testing.expectError(error.TypeMismatch, parseInto(C, DefaultTypes, a, "{\"rgb\":[1,2]}", .{}));
+}
+
+test "decode nested struct three levels deep" {
+    const C = struct {
+        a: struct {
+            b: struct {
+                c: struct { n: u32 },
+            },
+        },
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"a\":{\"b\":{\"c\":{\"n\":42}}}}", .{});
+    try testing.expectEqual(@as(u32, 42), c.a.b.c.n);
+}
+
+test "decode slice of structs" {
+    const User = struct { name: []const u8, age: u32 };
+    const C = struct { users: []const User };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"users\":[{\"name\":\"alice\",\"age\":30},{\"name\":\"bob\",\"age\":25}]}", .{});
+    try testing.expectEqual(@as(usize, 2), c.users.len);
+    try testing.expectEqualStrings("alice", c.users[0].name);
+    try testing.expectEqual(@as(u32, 25), c.users[1].age);
+}
+
+test "decode embedded Value field keeps dynamic subtree" {
+    const C = struct { meta: Value, n: u32 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"meta\":{\"a\":[1,2]},\"n\":5}", .{});
+    try testing.expectEqual(@as(u32, 5), c.n);
+    try testing.expect(c.meta == .object);
+    try testing.expectEqual(@as(i64, 2), c.meta.getT(i64, "a[1]").?);
+}
+
+test "decode raw Value passthrough at any variant" {
+    const C = struct { anything: Value };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const c = try parseInto(C, DefaultTypes, a, "{\"anything\":\"goes\"}", .{});
+    try testing.expectEqualStrings("goes", c.anything.string);
+    // `null` is a Value variant, so it passes through rather than erroring.
+    const c2 = try parseInto(C, DefaultTypes, a, "{\"anything\":null}", .{});
+    try testing.expect(c2.anything == .null);
+}
+
+test "decode: fromJson hook short-circuits built-in dispatch" {
+    const SemVer = struct {
+        major: u32,
+        minor: u32,
+        patch: u32,
+
+        pub fn fromJson(arena: std.mem.Allocator, value: Value, _: parser_mod.ParseOptions) DecodeError!@This() {
+            _ = arena;
+            if (value != .string) return error.TypeMismatch;
+            var it = std.mem.tokenizeAny(u8, value.string, ".");
+            const maj_s = it.next() orelse return error.TypeMismatch;
+            const min_s = it.next() orelse return error.TypeMismatch;
+            const pat_s = it.next() orelse return error.TypeMismatch;
+            const maj = std.fmt.parseInt(u32, maj_s, 10) catch return error.TypeMismatch;
+            const min = std.fmt.parseInt(u32, min_s, 10) catch return error.TypeMismatch;
+            const pat = std.fmt.parseInt(u32, pat_s, 10) catch return error.TypeMismatch;
+            return .{ .major = maj, .minor = min, .patch = pat };
+        }
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const C = struct { v: SemVer };
+    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"v\":\"1.2.3\"}", .{});
+    try testing.expectEqual(@as(u32, 1), c.v.major);
+    try testing.expectEqual(@as(u32, 2), c.v.minor);
+    try testing.expectEqual(@as(u32, 3), c.v.patch);
+}
+
+test "decode: json_rename unknown-field check uses renamed name" {
+    const C = struct {
+        pub const json_rename = .{ .listen_addr = "listen-addr" };
+        listen_addr: []const u8,
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    // Original snake_case key -- should error since renamed key is expected.
+    try testing.expectError(error.UnknownField, parseInto(C, DefaultTypes, ar.allocator(), "{\"listen_addr\":\"0.0.0.0\"}", .{}));
+}
+
+test "decode: json_skip rejects skipped key in strict mode" {
+    const C = struct {
+        pub const json_skip = .{"internal"};
+        name: []const u8,
+        internal: u32 = 7,
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    // Skipped fields are excluded from the expected-keys set,
+    // so a JSON key matching a skipped field is "unknown".
+    try testing.expectError(error.UnknownField, parseInto(C, DefaultTypes, ar.allocator(), "{\"name\":\"foo\",\"internal\":99}", .{}));
+}
+
+test "decode: json_flatten inner json_rename expands into expected keys" {
+    const Inner = struct {
+        pub const json_rename = .{ .log_level = "log-level" };
+        log_level: []const u8 = "info",
+    };
+    const Outer = struct {
+        pub const json_rename = .{ .listen_addr = "listen-addr" };
+        pub const json_flatten = .{"inner"};
+        listen_addr: []const u8,
+        inner: Inner,
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const c = try parseInto(Outer, DefaultTypes, ar.allocator(), "{\"listen-addr\":\"x\",\"log-level\":\"debug\"}", .{});
+    try testing.expectEqualStrings("x", c.listen_addr);
+    try testing.expectEqualStrings("debug", c.inner.log_level);
+}
+
+test "decode: json_flatten unknown-field check expands flattened keys" {
+    const Inner = struct { x: u32 };
+    const Outer = struct {
+        pub const json_flatten = .{"inner"};
+        name: []const u8,
+        inner: Inner,
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectError(error.UnknownField, parseInto(Outer, DefaultTypes, ar.allocator(), "{\"name\":\"foo\",\"x\":42,\"unexpected\":true}", .{}));
+}
+
+test "decode: tagged union missing discriminator -> MissingField" {
+    const Plugin = union(enum) {
+        pub const json_tag = "kind";
+        http: struct { host: []const u8 },
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectError(error.MissingField, parseInto(Plugin, DefaultTypes, ar.allocator(), "{\"host\":\"localhost\"}", .{}));
+}
+
+test "decode: tagged union unknown discriminator -> InvalidEnumValue" {
+    const Plugin = union(enum) {
+        pub const json_tag = "kind";
+        http: struct { host: []const u8 },
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectError(error.InvalidEnumValue, parseInto(Plugin, DefaultTypes, ar.allocator(), "{\"kind\":\"xyz\",\"host\":\"localhost\"}", .{}));
+}
+
+test "decode: tagged union unknown variant diagnostic suggests closest match" {
+    const Plugin = union(enum) {
+        pub const json_tag = "kind";
+        http: struct { port: u16 = 0 },
+        exec: struct { cmd: []const u8 = "" },
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(a);
+
+    _ = parseInto(Plugin, DefaultTypes, a, "{\"kind\":\"htpp\"}", .{ .errors = &errs }) catch {};
+    try testing.expect(errs.items.len == 1);
+    try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "unknown variant `htpp`") != null);
+    try testing.expectEqualStrings("http", errs.items[0].suggestion.?);
+}
+
+test "decode: tagged union missing discriminator diagnostic names tag field" {
+    const Plugin = union(enum) {
+        pub const json_tag = "kind";
+        http: struct { port: u16 = 0 },
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(a);
+
+    _ = parseInto(Plugin, DefaultTypes, a, "{\"port\":80}", .{ .errors = &errs }) catch {};
+    try testing.expect(errs.items.len == 1);
+    try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "missing discriminator field `kind`") != null);
+}
+
+test "decode: missing-field diagnostic reports the JSON wire key" {
+    const C = struct {
+        pub const json_rename = .{ .listen_addr = "listen-addr" };
+        listen_addr: []const u8,
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(a);
+
+    _ = parseInto(C, DefaultTypes, a, "{}", .{ .errors = &errs }) catch {};
+    try testing.expect(errs.items.len == 1);
+    try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "`listen-addr`") != null);
+    try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "listen_addr") == null);
+}
+
+test "decode: tagged union void variant" {
+    const Plugin = union(enum) {
+        pub const json_tag = "kind";
+        none,
+        http: struct { port: u16 },
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const p_ = try parseInto(Plugin, DefaultTypes, ar.allocator(), "{\"kind\":\"none\"}", .{});
+    try testing.expect(p_ == .none);
+}
+
+// A union without `json_tag` has no JSON shape to dispatch on, so it is
+// rejected at compile time ("json decode: unsupported type"). Not
+// runtime-testable; this mirrors the reference behavior.
+
+test "decode: unknown field suggests closest match" {
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(a);
+
+    // `prt` is a typo for `port`; `port` is also present so the required
+    // field is satisfied and the unknown-field check runs.
+    const C = struct { port: u16 };
+    _ = parseInto(C, DefaultTypes, a, "{\"port\":8080,\"prt\":9090}", .{ .errors = &errs }) catch {};
+
+    try testing.expect(errs.items.len == 1);
+    try testing.expect(errs.items[0].suggestion != null);
+    try testing.expectEqualStrings("port", errs.items[0].suggestion.?);
+}
+
+test "decode: nested type mismatch reports dotted path in message" {
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
+    defer errs.deinit(a);
+
+    const C = struct {
+        server: struct { port: u16 },
+    };
+    _ = parseInto(C, DefaultTypes, a, "{\"server\":{\"port\":\"8080\"}}", .{ .errors = &errs }) catch {};
+
+    try testing.expect(errs.items.len == 1);
+    try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "server.port") != null);
+}
+
+test "PathBuilder: push/restore symmetry" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var path: PathBuilder = .{ .buf = .empty };
+
+    const p1 = try path.pushSegment(arena.allocator(), "server");
+    try testing.expectEqualStrings("server", path.slice());
+
+    const p2 = try path.pushSegment(arena.allocator(), "port");
+    try testing.expectEqualStrings("server.port", path.slice());
+
+    path.restore(p2);
+    try testing.expectEqualStrings("server", path.slice());
+
+    const p3 = try path.pushIndex(arena.allocator(), 7);
+    try testing.expectEqualStrings("server[7]", path.slice());
+
+    path.restore(p3);
+    path.restore(p1);
+    try testing.expectEqualStrings("", path.slice());
+}
+
+test "decode operates on an already-parsed Value" {
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parse(a, "{\"title\":\"json\",\"port\":8080,\"enabled\":true}", .{});
+    const Config = struct {
+        title: []const u8,
+        port: u16,
+        enabled: bool,
+    };
+    const cfg = try decode(Config, DefaultTypes, a, v, .{});
+    try testing.expectEqualStrings("json", cfg.title);
+    try testing.expectEqual(@as(u16, 8080), cfg.port);
+    try testing.expectEqual(true, cfg.enabled);
+}
+
+test "wide-int round-trip: u64 max via encodeTyped -> parseInto" {
+    // encodeTyped emits u64 at full width; parseInto must recover it.
+    const S = struct { n: u64 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const encoder_mod = @import("encoder.zig");
+    const orig: S = .{ .n = std.math.maxInt(u64) };
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try encoder_mod.encodeTyped(&aw.writer, orig, DefaultTypes, a, .{});
+    // "18446744073709551615" must appear verbatim in the encoded output.
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "18446744073709551615") != null);
+    const back = try parseInto(S, DefaultTypes, a, aw.written(), .{});
+    try testing.expectEqual(std.math.maxInt(u64), back.n);
+}
+
+test "wide-int round-trip: i128 extremes via number_mode=.raw" {
+    const S = struct { n: i128 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const back_max = try parseInto(S, DefaultTypes, a, "{\"n\":170141183460469231731687303715884105727}", .{ .number_mode = .raw });
+    try testing.expectEqual(std.math.maxInt(i128), back_max.n);
+    const back_min = try parseInto(S, DefaultTypes, a, "{\"n\":-170141183460469231731687303715884105728}", .{ .number_mode = .raw });
+    try testing.expectEqual(std.math.minInt(i128), back_min.n);
+}
+
+test "wide-int round-trip: u128 max via number_mode=.raw" {
+    const S = struct { n: u128 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const back = try parseInto(S, DefaultTypes, a, "{\"n\":340282366920938463463374607431768211455}", .{ .number_mode = .raw });
+    try testing.expectEqual(std.math.maxInt(u128), back.n);
+}
+
+test "wide-int: value in (i64max, u64max] parses as .integer, getT(u64) returns it" {
+    // Values above i64 max but within u64 must NOT fall back to .float in typed mode.
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parse(a, "18446744073709551615", .{});
+    try testing.expect(v == .integer);
+    const as_u64 = v.getT(u64, "").?;
+    try testing.expectEqual(std.math.maxInt(u64), as_u64);
+}
+
+test "wide-int control: i64 min and small int still work" {
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const S = struct { a: i64, b: i32 };
+    const c = try parseInto(S, DefaultTypes, a, "{\"a\":-9223372036854775808,\"b\":7}", .{});
+    try testing.expectEqual(std.math.minInt(i64), c.a);
+    try testing.expectEqual(@as(i32, 7), c.b);
+}
+
+test "decode float narrowing overflow is Overflow" {
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const C32 = struct { x: f32 };
+    // 1e40 is finite as f64 but overflows f32 (~3.4e38 max).
+    try testing.expectError(error.Overflow, parseInto(C32, DefaultTypes, a, "{\"x\":1e40}", .{}));
+    // 3.5e38 is a float literal (stored as .float) that overflows f32.
+    try testing.expectError(error.Overflow, parseInto(C32, DefaultTypes, a, "{\"x\":3.5e38}", .{}));
+    // 3.0e38 is within f32 range -- must succeed.
+    const c = try parseInto(C32, DefaultTypes, a, "{\"x\":3.0e38}", .{});
+    try testing.expect(!std.math.isInf(c.x));
+
+    // Integer 66000 overflows f16 (max 65504) via @floatFromInt.
+    const C16 = struct { x: f16 };
+    try testing.expectError(error.Overflow, parseInto(C16, DefaultTypes, a, "{\"x\":66000}", .{}));
+
+    // f64 target with 1e40 -- no narrowing, finite result passes through.
+    const C64 = struct { x: f64 };
+    const c64 = try parseInto(C64, DefaultTypes, a, "{\"x\":1e40}", .{});
+    try testing.expect(!std.math.isInf(c64.x));
+}
+
+test "decode zero-length fixed array field compiles and decodes" {
+    const C = struct { xs: [0]u8, name: []const u8 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    // Empty JSON array for [0]u8 field must compile and decode successfully.
+    const c = try parseInto(C, DefaultTypes, a, "{\"xs\":[],\"name\":\"ok\"}", .{});
+    try testing.expectEqual([0]u8{}, c.xs);
+    try testing.expectEqualStrings("ok", c.name);
+    // Non-empty JSON array for [0]u8 field must be TypeMismatch (length mismatch).
+    try testing.expectError(error.TypeMismatch, parseInto(C, DefaultTypes, a, "{\"xs\":[1],\"name\":\"ok\"}", .{}));
+}
+
+test "wide-int Document.set u64 max succeeds; u128 above i128 max returns error" {
+    const document_mod = @import("document.zig");
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var doc = try document_mod.Document.parse(a, "{\"x\":0}", .{});
+    // Setting a u64 max value must not panic.
+    try doc.set("x", @as(u64, std.math.maxInt(u64)));
+    try testing.expectEqual(std.math.maxInt(u64), doc.getT(u64, "x").?);
+    // u128 above i128 max is unrepresentable as .integer and must error.
+    try testing.expectError(error.InvalidValue, doc.set("x", @as(u128, std.math.maxInt(u128))));
+}
+
+// Streaming typed decode
+
+/// Allocator wrapper that counts bytes handed out. Used to bound the
+/// allocation cost of the streaming typed decode path.
+const CountingAllocator = struct {
+    child: Allocator,
+    total: usize = 0,
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.total += len;
+        return self.child.vtable.alloc(self.child.ptr, len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) self.total += new_len - memory.len;
+        return self.child.vtable.resize(self.child.ptr, memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) self.total += new_len - memory.len;
+        return self.child.vtable.remap(self.child.ptr, memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.vtable.free(self.child.ptr, memory, alignment, ret_addr);
+    }
+};
+
+test "parseInto streams: allocation bounded, no Value tree materialized" {
+    // An array of structs large enough that tree materialization (a Value
+    // box plus an ObjectMap per element) dwarfs the decoded output. The
+    // streaming path must stay within a small multiple of the input size;
+    // the tree path exceeds it several times over.
+    const Rec = struct {
+        id: u64,
+        name: []const u8,
+        active: bool,
+        score: f64,
+        tags: []const []const u8,
+    };
+
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.append(testing.allocator, '[');
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        if (i != 0) try src.append(testing.allocator, ',');
+        var buf: [160]u8 = undefined;
+        const rec = try std.fmt.bufPrint(&buf, "{{\"id\":{d},\"name\":\"record-{d}\",\"active\":{},\"score\":{d}.5,\"tags\":[\"a\",\"b\"]}}", .{ i, i, i % 2 == 0, i % 100 });
+        try src.appendSlice(testing.allocator, rec);
+    }
+    try src.append(testing.allocator, ']');
+
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var counting: CountingAllocator = .{ .child = ar.allocator() };
+
+    const out = try parseInto([]const Rec, DefaultTypes, counting.allocator(), src.items, .{});
+    try testing.expectEqual(@as(usize, 2000), out.len);
+    try testing.expectEqualStrings("record-1999", out[1999].name);
+
+    var tree_arena = ArenaAllocator.init(testing.allocator);
+    defer tree_arena.deinit();
+    var tree_counting: CountingAllocator = .{ .child = tree_arena.allocator() };
+    const tree_out = try parseIntoTree([]const Rec, DefaultTypes, tree_counting.allocator(), src.items, .{});
+    try testing.expectEqual(@as(usize, 2000), tree_out.len);
+
+    // The streaming path allocates the decoded output plus list-growth
+    // copies (measured ~6x input for this shape; the growth copies and
+    // arena slack, not any tree). The tree path materializes a Value box
+    // and an ObjectMap per element on top (measured ~26x). Bound the
+    // streaming path well under the tree cost so a regression to tree
+    // materialization fails loudly.
+    try testing.expect(counting.total <= src.items.len * 8);
+    try testing.expect(counting.total * 3 <= tree_counting.total);
+}
+
+test "streaming equivalence: duplicate key with invalid first occurrence decodes last-wins" {
+    // The tree parser resolves duplicates before decode (last wins), so a
+    // type-invalid FIRST occurrence must not fail parseInto: the streaming
+    // pass errors, falls back to the tree, and succeeds.
+    const T = struct { a: u32 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const v = try parseInto(T, DefaultTypes, ar.allocator(), "{\"a\":\"not an int\",\"a\":7}", .{});
+    try testing.expectEqual(@as(u32, 7), v.a);
+}
+
+test "streaming equivalence: unknown field wins over earlier type error" {
+    // decodeStruct checks unknown keys over the whole object before any
+    // field decode, so UnknownField must surface even when an earlier
+    // field value would TypeMismatch.
+    const T = struct { a: u32 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    try testing.expectError(error.UnknownField, parseInto(T, DefaultTypes, ar.allocator(), "{\"a\":\"bad\",\"zzz\":1}", .{}));
+}
+
+test "streaming: jsonc comments and trailing commas decode typed" {
+    const T = struct { a: u32, tags: []const []const u8 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const v = try parseInto(T, DefaultTypes, ar.allocator(),
+        \\{
+        \\  // comment
+        \\  "a": 3,
+        \\  "tags": ["x", "y",],
+        \\}
+    , .{ .dialect = .jsonc });
+    try testing.expectEqual(@as(u32, 3), v.a);
+    try testing.expectEqual(@as(usize, 2), v.tags.len);
+}
+
+test "streaming: escaped object key matches field" {
+    const T = struct { name: u32 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const v = try parseInto(T, DefaultTypes, ar.allocator(), "{\"na\\u006de\":5}", .{});
+    try testing.expectEqual(@as(u32, 5), v.name);
+}
+
+test "streaming: deep nesting inside ignored unknown field is depth-bounded" {
+    const T = struct { a: u32 = 0 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "{\"junk\":");
+    try src.appendNTimes(testing.allocator, '[', 200);
+    try src.appendNTimes(testing.allocator, ']', 200);
+    try src.appendSlice(testing.allocator, "}");
+    try testing.expectError(error.NestingTooDeep, parseInto(T, DefaultTypes, ar.allocator(), src.items, .{ .ignore_unknown_fields = true }));
+}
+
+test "streaming: u128 beyond i128 range errors typed, decodes raw" {
+    const T = struct { n: u128 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const big = "{\"n\":200000000000000000000000000000000000000}";
+    // Typed mode: the tree stores integers as i128 (overflow falls back to
+    // float), so the streaming pass must not sneak a wider direct parse in.
+    try testing.expectError(error.TypeMismatch, parseInto(T, DefaultTypes, ar.allocator(), big, .{}));
+    // Raw mode: the verbatim lexeme decodes straight into u128, both paths.
+    const v = try parseInto(T, DefaultTypes, ar.allocator(), big, .{ .number_mode = .raw });
+    try testing.expectEqual(@as(u128, 200000000000000000000000000000000000000), v.n);
+}
+
+test "streaming: flatten inside flatten decodes from one object" {
+    const Innermost = struct { z: u32 };
+    const Inner = struct {
+        y: u32,
+        deep: Innermost,
+        pub const json_flatten = .{"deep"};
+    };
+    const T = struct {
+        x: u32,
+        flat: Inner,
+        skipped: u8 = 42,
+        pub const json_flatten = .{"flat"};
+        pub const json_skip = .{"skipped"};
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const v = try parseInto(T, DefaultTypes, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3}", .{});
+    try testing.expectEqual(@as(u32, 1), v.x);
+    try testing.expectEqual(@as(u32, 2), v.flat.y);
+    try testing.expectEqual(@as(u32, 3), v.flat.deep.z);
+    try testing.expectEqual(@as(u8, 42), v.skipped);
+    // A key unknown to every level is UnknownField, matching expectedKeys.
+    try testing.expectError(error.UnknownField, parseInto(T, DefaultTypes, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3,\"w\":4}", .{}));
+    // The skipped field's wire name is NOT an expected key.
+    try testing.expectError(error.UnknownField, parseInto(T, DefaultTypes, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3,\"skipped\":9}", .{}));
+}

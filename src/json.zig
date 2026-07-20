@@ -57,10 +57,10 @@ pub const Diagnostic = parser_mod.Diagnostic;
 /// All knobs for `parse`. Default is `.{}` (strict JSON, depth 128).
 pub const ParseOptions = parser_mod.ParseOptions;
 
-/// Type annotation.
+/// Type annotation. See `src/annotation.zig`.
 pub const TypeAnnotationProvider = annotation_mod.TypeAnnotationProvider;
 pub const TypeAnnotationOptions = annotation_mod.TypeAnnotationOptions;
-pub const DefaultTypeAnnotation = annotation_mod.DefaultTypeAnnotation;
+pub const DefaultTypes = annotation_mod.DefaultTypes;
 
 /// Number materialization policy for the dynamic `Value` tree. `.typed`
 /// (default) yields `.integer`/`.float`; `.raw` yields `.number_raw` with
@@ -134,8 +134,9 @@ pub const DecodeError = decode_mod.DecodeError;
 /// Supports bool, ints (overflow-checked), floats, `[]const u8`,
 /// slices, fixed-size arrays, optionals, nested structs, enums (string
 /// name or integer tag), tagged unions via `json_tag`, embedded `Value`
-/// fields (kept dynamic), custom `fromJson` hooks, and the
-/// `json_rename` / `json_skip` / `json_flatten` annotations.
+/// fields (kept dynamic), custom `fromJson` hooks, the
+/// `json_rename` / `json_skip` / `json_flatten` annotations via
+/// declarations in `T` and `TAnnotation`.
 ///
 /// Number policy: float targets accept `.integer` values, but integer
 /// targets do NOT accept `.float` -- `1e2` parses as `.float` and stays
@@ -203,8 +204,8 @@ pub fn encode(w: *std.Io.Writer, value: Value, options: EncodeOptions) EncodeErr
 /// Annotations and hooks are read from `@TypeOf(value)`, so bind an
 /// anonymous struct literal to the annotated type before passing it
 /// (an anonymous literal's type carries no declarations).
-pub fn encodeTyped(w: *std.Io.Writer, value: anytype, arena: std.mem.Allocator, options: EncodeOptions) EncodeError!void {
-    return encoder_mod.encodeTyped(w, value, arena, options);
+pub fn encodeTyped(w: *std.Io.Writer, value: anytype, comptime TAnnotation: type, arena: std.mem.Allocator, options: EncodeOptions) EncodeError!void {
+    return encoder_mod.encodeTyped(w, value, TAnnotation, arena, options);
 }
 
 test "spans recorded per dotted path" {

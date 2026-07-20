@@ -7,7 +7,8 @@
 //! raw (UTF-8 output); only `"`, `\`, and control bytes are escaped.
 //!
 //! `encodeTyped` walks a typed Zig value directly instead, consulting
-//! the same `json_*` annotations and hooks as typed decoding.
+//! the same TypeAnnotationProvider and `json_*` annotations and hooks
+//! as typed decoding.
 //!
 //! Floats: zero and values with |x| in [1e-6, 1e21) use shortest
 //! round-trip decimal notation; values outside that range use shortest
@@ -77,14 +78,18 @@ pub fn encode(w: *Io.Writer, value: Value, options: EncodeOptions) EncodeError!v
 }
 
 /// Encode a typed Zig value as compact JSON, consulting the same
-/// `json_rename` / `json_skip` / `json_flatten` / `json_tag` annotations
-/// and `toJson` hooks that typed decoding consults, so output decodes
-/// back via `parseInto(T, ...)`.
+/// TypeAnnotationProvider and `json_rename` / `json_skip` /
+/// `json_flatten` / `json_tag` annotations and `toJson` hooks that
+/// typed decoding consults, so output decodes back via
+/// `parseInto(T, ...)`.
 ///
-/// Annotations and hooks are read from `@TypeOf(value)`. Bind an
-/// anonymous struct literal to the annotated type before passing it:
-/// an anonymous literal has its own type, which carries no declarations,
-/// so annotation-driven behavior would silently not apply.
+/// Annotations and hooks are read from `TAnnotation` and `@TypeOf(value)`.
+/// `TAnnotation` hooks take priority over `@TypeOf(value)` hooks.
+///
+/// Bind an anonymous struct literal to the annotated type before passing
+/// it: an anonymous literal has its own type, which carries no
+/// declarations, so annotation-driven behavior would silently not apply.
+/// `TAnnotation` fields are compile-checked earlier.
 ///
 /// Integer round-trip: integer fields are emitted at full width, so a
 /// u64 field emits all 64 bits (e.g. "18446744073709551615"). `parseInto`
@@ -237,8 +242,8 @@ fn writeTypedTaggedUnion(comptime T: type, comptime TAnnotation: type, value: T,
     var first = true;
     inline for (@typeInfo(T).@"union".fields) |union_field| {
         if (active == @field(std.meta.Tag(T), union_field.name)) {
-            const tag_field = if (TAnnotation.getOrEmpty(T)) |annotation| block: {
-                if (annotation.json_tag) |json_tag| {
+            const tag_field = if (TAnnotation.getOrEmpty(T)) |a| block: {
+                if (a.json_tag) |json_tag| {
                     break :block json_tag;
                 }
                 break :block T.json_tag;
@@ -277,8 +282,8 @@ fn writeTypedTaggedUnionSorted(comptime T: type, comptime TAnnotation: type, val
     inline for (@typeInfo(T).@"union".fields) |union_field| {
         if (active == @field(std.meta.Tag(T), union_field.name)) {
             try members.append(arena, .{
-                .key = if (TAnnotation.getOrEmpty(T)) |annotation| block: {
-                    if (annotation.json_tag) |json_tag| {
+                .key = if (TAnnotation.getOrEmpty(T)) |a| block: {
+                    if (a.json_tag) |json_tag| {
                         break :block json_tag;
                     }
                     break :block T.json_tag;
@@ -485,6 +490,8 @@ fn writeFloat(w: *Io.Writer, f: f64) EncodeError!void {
 
 const parse = @import("parser.zig").parse;
 const parseInto = decode_mod.parseInto;
+const annotation = @import("annotation.zig");
+const DefaultTypes = annotation.DefaultTypes;
 
 test "encode compact canonical" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -911,7 +918,7 @@ test "encodeTyped honors annotations symmetric with decode" {
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const cfg: C = .{ .listen_addr = "x", .port = 1 };
-    try encodeTyped(&aw.writer, cfg, a, .{});
+    try encodeTyped(&aw.writer, cfg, DefaultTypes, a, .{});
     try std.testing.expectEqualStrings("{\"listen-addr\":\"x\",\"port\":1}", aw.written());
 }
 
@@ -923,8 +930,8 @@ test "typed round-trip" {
     const orig: C = .{ .name = "n", .tags = &.{ "a", "b" } };
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
-    try encodeTyped(&aw.writer, orig, a, .{});
-    const back = try parseInto(C, a, aw.written(), .{});
+    try encodeTyped(&aw.writer, orig, DefaultTypes, a, .{});
+    const back = try parseInto(C, DefaultTypes, a, aw.written(), .{});
     try std.testing.expectEqualStrings("n", back.name);
     try std.testing.expectEqualStrings("b", back.tags[1]);
 }
@@ -942,7 +949,7 @@ test "encodeTyped: json_flatten inlines inner fields" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const outer: Outer = .{ .name = "foo", .inner = .{ .x = 1, .y = 2 } };
-    try encodeTyped(&aw.writer, outer, a, .{});
+    try encodeTyped(&aw.writer, outer, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"name\":\"foo\",\"x\":1,\"y\":2}", aw.written());
 }
 
@@ -958,12 +965,12 @@ test "encodeTyped: tagged union emits discriminator first" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const http: Plugin = .{ .http = .{ .port = 80 } };
-    try encodeTyped(&aw.writer, http, a, .{});
+    try encodeTyped(&aw.writer, http, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"kind\":\"http\",\"port\":80,\"secure\":false}", aw.written());
 
     aw.clearRetainingCapacity();
     const none: Plugin = .none;
-    try encodeTyped(&aw.writer, none, a, .{});
+    try encodeTyped(&aw.writer, none, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"kind\":\"none\"}", aw.written());
 }
 
@@ -975,7 +982,7 @@ test "encodeTyped: enum emits tag name string" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .mode = .slow };
-    try encodeTyped(&aw.writer, c, a, .{});
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"mode\":\"slow\"}", aw.written());
 }
 
@@ -997,7 +1004,7 @@ test "encodeTyped: toJson hook overrides built-in encoding" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .v = .{ .major = 1, .minor = 2, .patch = 3 } };
-    try encodeTyped(&aw.writer, c, a, .{});
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"v\":\"1.2.3\"}", aw.written());
 }
 
@@ -1009,11 +1016,11 @@ test "encodeTyped: null optional omitted, non-null present" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .a = null, .b = 2 };
-    try encodeTyped(&aw.writer, c, a, .{});
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"b\":2}", aw.written());
 
     // The omitted key decodes back to null: lossless round-trip.
-    const back = try parseInto(C, a, aw.written(), .{});
+    const back = try parseInto(C, DefaultTypes, a, aw.written(), .{});
     try testing.expectEqual(@as(?u32, null), back.a);
     try testing.expectEqual(@as(?u32, 2), back.b);
 }
@@ -1027,7 +1034,7 @@ test "encodeTyped: embedded Value encodes dynamically" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .meta = meta, .n = 5 };
-    try encodeTyped(&aw.writer, c, a, .{});
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"meta\":{\"a\":[1,2]},\"n\":5}", aw.written());
 }
 
@@ -1039,7 +1046,7 @@ test "encodeTyped: NaN float is unrepresentable" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .x = std.math.nan(f64) };
-    try testing.expectError(error.UnrepresentableFloat, encodeTyped(&aw.writer, c, a, .{}));
+    try testing.expectError(error.UnrepresentableFloat, encodeTyped(&aw.writer, c, DefaultTypes, a, .{}));
 }
 
 test "encodeTyped: fixed array encodes as JSON array" {
@@ -1050,7 +1057,7 @@ test "encodeTyped: fixed array encodes as JSON array" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .rgb = .{ 1, 2, 3 } };
-    try encodeTyped(&aw.writer, c, a, .{});
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"rgb\":[1,2,3]}", aw.written());
 }
 
@@ -1080,13 +1087,13 @@ test "encodeTyped: full annotation round-trip" {
     };
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
-    try encodeTyped(&aw.writer, orig, a, .{});
+    try encodeTyped(&aw.writer, orig, DefaultTypes, a, .{});
     try testing.expectEqualStrings(
         "{\"listen-addr\":\"x\",\"verbose\":true,\"plugin\":{\"kind\":\"http\",\"port\":80}}",
         aw.written(),
     );
 
-    const back = try parseInto(C, a, aw.written(), .{});
+    const back = try parseInto(C, DefaultTypes, a, aw.written(), .{});
     try testing.expectEqualStrings("x", back.listen_addr);
     try testing.expectEqual(@as(u32, 7), back.runtime);
     try testing.expectEqual(true, back.common.verbose);
@@ -1154,7 +1161,7 @@ test "sort_keys: empty object stays {}" {
     try encode(&aw.writer, .{ .object = .empty }, .{ .sort_keys = true });
     try testing.expectEqualStrings("{}", aw.written());
     aw.clearRetainingCapacity();
-    try encodeTyped(&aw.writer, .{}, a, .{ .sort_keys = true });
+    try encodeTyped(&aw.writer, .{}, DefaultTypes, a, .{ .sort_keys = true });
     try testing.expectEqualStrings("{}", aw.written());
 }
 
@@ -1166,11 +1173,11 @@ test "sort_keys: typed struct fields in key order, default keeps declaration" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .zebra = 1, .apple = 2, .mango = 3 };
-    try encodeTyped(&aw.writer, c, a, .{ .sort_keys = true });
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{ .sort_keys = true });
     try testing.expectEqualStrings("{\"apple\":2,\"mango\":3,\"zebra\":1}", aw.written());
 
     aw.clearRetainingCapacity();
-    try encodeTyped(&aw.writer, c, a, .{});
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{});
     try testing.expectEqualStrings("{\"zebra\":1,\"apple\":2,\"mango\":3}", aw.written());
 }
 
@@ -1187,7 +1194,7 @@ test "sort_keys: typed sorts by emitted (renamed) key, recursively" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .zed = 1, .bbb = .{ .yy = 2, .xx = 3 } };
-    try encodeTyped(&aw.writer, c, a, .{ .sort_keys = true });
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{ .sort_keys = true });
     // "aaa" (zed renamed) sorts before "bbb"; inner sorts xx before yy.
     try testing.expectEqualStrings("{\"aaa\":1,\"bbb\":{\"xx\":3,\"yy\":2}}", aw.written());
 }
@@ -1206,7 +1213,7 @@ test "sort_keys: flattened fields sort merged into the parent object" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const c: C = .{ .z = 1, .inner = .{ .m = 2, .a = 3 }, .b = 4 };
-    try encodeTyped(&aw.writer, c, a, .{ .sort_keys = true });
+    try encodeTyped(&aw.writer, c, DefaultTypes, a, .{ .sort_keys = true });
     // Flattened a,m interleave with z,b under one sort: a,b,m,z.
     try testing.expectEqualStrings("{\"a\":3,\"b\":4,\"m\":2,\"z\":1}", aw.written());
 }
@@ -1223,7 +1230,7 @@ test "sort_keys: tagged union discriminator sorts among the payload" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     const http: Plugin = .{ .http = .{ .port = 80, .addr = 1 } };
-    try encodeTyped(&aw.writer, http, a, .{ .sort_keys = true });
+    try encodeTyped(&aw.writer, http, DefaultTypes, a, .{ .sort_keys = true });
     // keys addr, kind, port in order (kind is the discriminator).
     try testing.expectEqualStrings("{\"addr\":1,\"kind\":\"http\",\"port\":80}", aw.written());
 }

@@ -279,11 +279,11 @@ fn checkTypedStream(a: std.mem.Allocator, input: []const u8, dialect: json.Diale
     };
     inline for (.{ AllOpt, []const AllOpt, []const f64, []const []const u8, [2]f64 }) |T| {
         const opts: json.ParseOptions = .{ .dialect = dialect, .ignore_unknown_fields = true };
-        const streamed_opt: ?T = json.parseInto(T, json.DefaultTypeAnnotation, a, input, opts) catch |err| blk: {
+        const streamed_opt: ?T = json.parseInto(T, json.DefaultTypes, a, input, opts) catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             break :blk null;
         };
-        const tree_opt: ?T = treeParseInto(T, json.DefaultTypeAnnotation, a, input, opts) catch |err| blk: {
+        const tree_opt: ?T = treeParseInto(T, json.DefaultTypes, a, input, opts) catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             break :blk null;
         };
