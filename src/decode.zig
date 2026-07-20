@@ -526,6 +526,7 @@ fn decodeTaggedUnion(comptime T: type, comptime TAnnotation: type, arena: Alloca
         if (annotation.json_tag) |json_tag| {
             break :block json_tag;
         }
+        break :block T.json_tag;
     } else T.json_tag;
 
     const tag_value = obj.get(tag_field) orelse {

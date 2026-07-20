@@ -14,7 +14,7 @@ const Value = v.Value;
 pub fn TypeAnnotationProvider(comptime T: type) type {
     return struct {
         ///
-        pub const annotation_type: type = T;
+        pub const associated_type: type = T;
 
         /// Name overrides.
         json_rename: ?type = null,
@@ -46,7 +46,7 @@ pub fn TypeAnnotationOptions(comptime options: anytype) type {
     comptime {
         for (options) |annotation_entry| {
             const TOption = @TypeOf(annotation_entry);
-            if (!@hasDecl(TOption, "annotation_type")) break;
+            if (!@hasDecl(TOption, "associated_type")) break;
             if (!@hasField(TOption, "json_rename")) break;
             if (!@hasField(TOption, "json_flatten")) break;
             if (!@hasField(TOption, "json_skip")) break;
@@ -54,7 +54,7 @@ pub fn TypeAnnotationOptions(comptime options: anytype) type {
             if (!@hasField(TOption, "toJson")) break;
             if (!@hasField(TOption, "json_tag")) break;
 
-            const T = TOption.annotation_type;
+            const T = TOption.associated_type;
             const kind = if (@typeInfo(T) == .@"union") "variant" else "field";
             if (annotation_entry.json_rename) |rename| {
                 for (@typeInfo(rename).@"struct".fields) |rf| {
@@ -84,7 +84,7 @@ pub fn TypeAnnotationOptions(comptime options: anytype) type {
             pub fn has(comptime T: type) bool {
                 return inline for (annotation) |annotation_entry| {
                     const TOption = @TypeOf(annotation_entry);
-                    if (TOption.annotation_type == T) break true;
+                    if (TOption.associated_type == T) break true;
                 } else false;
             }
 
@@ -92,14 +92,14 @@ pub fn TypeAnnotationOptions(comptime options: anytype) type {
             pub fn get(comptime T: type) TypeAnnotationProvider(T) {
                 inline for (annotation) |annotation_entry| {
                     const TOption = @TypeOf(annotation_entry);
-                    if (TOption.annotation_type == T) return annotation_entry;
+                    if (TOption.associated_type == T) return annotation_entry;
                 } else @compileError("Annotation registry lacks entry for " ++ T ++ ".");
             }
 
             pub fn getOrEmpty(comptime T: type) ?TypeAnnotationProvider(T) {
                 return inline for (annotation) |annotation_entry| {
                     const TOption = @TypeOf(annotation_entry);
-                    if (TOption.annotation_type == T) break annotation_entry;
+                    if (TOption.associated_type == T) break annotation_entry;
                 } else null;
             }
         };
