@@ -119,28 +119,25 @@ pub fn validateAnnotations(comptime T: type) void {
 pub fn renamedKey(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) []const u8 {
     if (TAnnotation.getOrEmpty(T)) |annotation| {
         if (annotation.json_rename) |r| {
-            if (@hasField(@TypeOf(r), field_name)) return @field(r, field_name);
-            return field_name;
+            if (@hasDecl(r, field_name)) return @field(r, field_name);
         }
     }
     if (@hasDecl(T, "json_rename")) {
         const r = T.json_rename;
-        if (@hasField(@TypeOf(r), field_name)) return @field(r, field_name);
+        if (@hasField(r, field_name)) return @field(r, field_name);
     }
     return field_name;
 }
 
-/// TODO
 /// Returns true if `field_name` on type `T` is listed in `T.json_skip`.
 pub fn isSkipped(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) bool {
-    const skip = if (TAnnotation.getOrEmpty(T)) |annotation| {
-        if (annotation.json_skip) |skips| {
-            skips;
+    const skip = blk: {
+        if (TAnnotation.getOrEmpty(T)) |annotation| {
+            break :blk annotation.json_skip orelse &[_][]const u8{};
         }
-    } else if (@hasDecl(T, "json_skip"))
-        T.json_skip
-    else
-        return false;
+        if (@hasDecl(T, "json_skip")) break :blk T.json_skip;
+        break :blk &[_][]const u8{};
+    };
 
     inline for (skip) |name| {
         if (comptime std.mem.eql(u8, name, field_name)) return true;
@@ -148,17 +145,15 @@ pub fn isSkipped(comptime T: type, comptime TAnnotation: type, comptime field_na
     return false;
 }
 
-/// TODO
 /// Returns true if `field_name` on type `T` is listed in `T.json_flatten`.
 pub fn isFlattened(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) bool {
-    const flat = if (TAnnotation.getOrEmpty(T)) |annotation| {
-        if (annotation.json_flatten) |flatten| {
-            flatten;
+    const flat = blk: {
+        if (TAnnotation.getOrEmpty(T)) |annotation| {
+            break :blk annotation.json_flatten orelse &[_][]const u8{};
         }
-    } else if (@hasDecl(T, "json_flatten"))
-        T.json_flatten
-    else
-        return false;
+        if (@hasDecl(T, "json_flatten")) break :blk T.json_flatten;
+        break :blk &[_][]const u8{};
+    };
 
     inline for (flat) |name| {
         if (comptime std.mem.eql(u8, name, field_name)) return true;
