@@ -94,18 +94,18 @@ const Frame = struct {
 pub const EventReader = struct {
     gpa: std.mem.Allocator,
     options: StreamOptions,
-    buf: std.ArrayList(u8) = .empty,      // unconsumed bytes (sliding window)
-    base: u64 = 0,                         // absolute stream offset of buf.items[0]
-    pos: usize = 0,                        // cursor within buf
-    stack: std.ArrayList(Frame) = .empty,  // container nesting; len bounded by max_depth
-    top_done: bool = false,                // a complete top-level value has been emitted
-    allow_multi: bool = false,             // when true, reset top_done instead of erroring on second top-level value
-    ended: bool = false,                   // endInput()/EOF observed
-    closed: bool = false,                  // end_of_input already returned
+    buf: std.ArrayList(u8) = .empty, // unconsumed bytes (sliding window)
+    base: u64 = 0, // absolute stream offset of buf.items[0]
+    pos: usize = 0, // cursor within buf
+    stack: std.ArrayList(Frame) = .empty, // container nesting; len bounded by max_depth
+    top_done: bool = false, // a complete top-level value has been emitted
+    allow_multi: bool = false, // when true, reset top_done instead of erroring on second top-level value
+    ended: bool = false, // endInput()/EOF observed
+    closed: bool = false, // end_of_input already returned
     reader: ?*std.Io.Reader = null,
-    scratch: std.ArrayList(u8) = .empty,   // assembled boundary token / decoded string
+    scratch: std.ArrayList(u8) = .empty, // assembled boundary token / decoded string
     diag: ?Diagnostic = null,
-    last: ?Event = null,                   // most recent event returned by next()
+    last: ?Event = null, // most recent event returned by next()
     /// A materialize() suspended by error.NeedMoreInput: the partially
     /// built container stack, resumed by the next materialize() call.
     /// Partial values live in the arena of the suspended call, so the
@@ -1216,7 +1216,12 @@ fn eventTagsSplit(a: std.mem.Allocator, src: []const u8, at: usize) ![]std.meta.
     while (true) {
         const r = er.next() catch |e| switch (e) {
             error.NeedMoreInput => {
-                if (fed < src.len) { try er.feed(src[fed..]); fed = src.len; er.endInput(); continue; }
+                if (fed < src.len) {
+                    try er.feed(src[fed..]);
+                    fed = src.len;
+                    er.endInput();
+                    continue;
+                }
                 er.endInput();
                 continue;
             },
@@ -1542,7 +1547,12 @@ fn eventTagsSplitJsonc(a: std.mem.Allocator, src: []const u8, at: usize) ![]std.
     while (true) {
         const r = er.next() catch |e| switch (e) {
             error.NeedMoreInput => {
-                if (fed < src.len) { try er.feed(src[fed..]); fed = src.len; er.endInput(); continue; }
+                if (fed < src.len) {
+                    try er.feed(src[fed..]);
+                    fed = src.len;
+                    er.endInput();
+                    continue;
+                }
                 er.endInput();
                 continue;
             },

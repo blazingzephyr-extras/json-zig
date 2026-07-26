@@ -724,10 +724,10 @@ test "number policy: integer range extends to i128" {
 
 test "parseIntFast matches parseInt across the accepted range" {
     const cases = [_][]const u8{
-        "0",                   "-0",                  "1",
-        "-1",                  "9",                   "10",
-        "100",                 "-100",                "999999999999999999", // 18 nines
-        "-999999999999999999", "123456789012345678",  "-123456789012345678",
+        "0",  "-0", "1",
+        "-1", "9",  "10",
+        "100",                 "-100",               "999999999999999999", // 18 nines
+        "-999999999999999999", "123456789012345678", "-123456789012345678",
     };
     for (cases) |s| {
         const fast = parseIntFast(s).?;
