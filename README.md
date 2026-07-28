@@ -224,12 +224,28 @@ separators, comments, and surrounding formatting stay put. `set` on a
 missing leaf appends a new member to its enclosing object, matching the
 surrounding style (single-line objects get `, "k": v`; multi-line objects
 get a comma, newline, and the indentation inferred from the last sibling).
+Missing intermediate objects along the path are created too (`set("a.b.c",
+v)` creates `a` and `a.b` as needed); array elements are still only ever
+replaced, never created.
 
 ```jsonc
 // Before:
 { "x": 1, "y": 2 }
 // doc.setLiteral("x", "99") produces:
 { "x": 99, "y": 2 }
+```
+
+`Document.empty(arena, options)` bootstraps a document with no source
+bytes at all -- the first `set` splices the root object and the whole
+path in as one edit, for the "file doesn't exist yet" case. And
+`setValueSegments` / `setSegments` / `removeSegments` take a path as
+pre-split key segments instead of a dotted string, so a key containing a
+literal `.` is addressed unambiguously:
+
+```zig
+var doc = try json.Document.empty(arena, .{});
+try doc.setSegments(&.{ "host", "example.com" }, "1.2.3.4");
+// {"host": {"example.com": "1.2.3.4"}} -- one literal key, not nested.
 ```
 
 ### Source spans
@@ -478,6 +494,7 @@ through an edit cycle, and its comment-editing calls
 | `encodePretty(w, value, options)` | Emit indented JSON. |
 | `encodeTyped(w, value, TAnnotation, arena)` | Encode a typed value, honoring annotations and hooks. |
 | `Document.parse(arena, src, options)` | Lossless parse for the document model. |
+| `Document.empty(arena, options)` | Bootstrap a document with no source bytes. |
 | `Tokenizer.init(src, dialect)` / `.next()` | Lexer-level token stream for tooling. |
 | `EventReader.fromReader(gpa, reader, options)` | Incremental SAX reader backed by a `std.Io.Reader`. |
 | `EventReader.init(gpa, options)` / `.feed(bytes)` / `.endInput()` | Feed-core variant; caller pushes bytes on demand. |
@@ -552,13 +569,14 @@ zig build bench
 The harness reports min/p50/p99/max latency and throughput across multiple
 samples with explicit warmup. See `bench/main.zig`.
 
-On aarch64-linux, ReleaseFast, this lands at roughly:
+On an Apple M1 Max (aarch64-macos), Zig 0.16.0, ReleaseFast -- p50
+latency, median of ten runs, cross-run spread below 8% per cell:
 
 | Benchmark | small (1.2 KB) | medium (22 KB) | large (391 KB) |
 | --- | --- | --- | --- |
-| parse (strict) | 3.58 us, 314 MB/s | 54.7 us, 396 MB/s | 1.13 ms, 338 MB/s |
-| encode (compact) | 1.33 us, 643 MB/s | 11.5 us, 1361 MB/s | 413 us, 683 MB/s |
-| Document parse+emit | 5.58 us, 201 MB/s | 88.6 us, 244 MB/s | 2.15 ms, 178 MB/s |
+| parse (strict) | 2.92 us, 386 MB/s | 42.5 us, 509 MB/s | 1.06 ms, 360 MB/s |
+| encode (compact) | 1.54 us, 555 MB/s | 15.4 us, 1022 MB/s | 486 us, 580 MB/s |
+| Document parse+emit | 5.04 us, 223 MB/s | 75.9 us, 285 MB/s | 1.89 ms, 202 MB/s |
 
 (p50 latency; encode throughput is measured against the bytes produced,
 which for compact output is smaller than the input.)

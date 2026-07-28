@@ -5,24 +5,33 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+# Cancel any in-flight runs for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   ZIG_VERSION: "0.16.0"
 
 jobs:
+  # Native build + full test suite.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest      # x86_64-linux
-          - ubuntu-24.04-arm   # aarch64-linux
-          - macos-latest       # aarch64-macos
-          - windows-latest     # x86_64-windows
+          - ubuntu-latest          # x86_64-linux
+          - ubuntu-24.04-arm       # aarch64-linux
+          - macos-latest           # aarch64-macos
+          - windows-latest         # x86_64-windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
       - name: install zig (unix)
         if: runner.os != 'Windows'
         shell: bash
@@ -37,6 +46,7 @@ jobs:
           mkdir -p "$HOME/zig"
           curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
           echo "$HOME/zig/zig-${triple}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
       - name: install zig (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -47,8 +57,23 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile zig.zip
           Expand-Archive -LiteralPath zig.zip -DestinationPath $dst
           "$dst\zig-x86_64-windows-$env:ZIG_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-      - name: test
+
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache
+          key: zig-cache-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-
+
+      - name: format check
+        run: zig fmt --check build.zig src tests examples bench fuzz
+
+      - name: zig build test
         run: zig build test --summary all
+
+      - name: zig build (release)
+        run: zig build -Doptimize=ReleaseFast --summary all
+
       - name: build examples
         run: zig build examples
 
@@ -57,6 +82,7 @@ jobs:
   cross-compile:
     name: cross (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -70,7 +96,7 @@ jobs:
           - riscv64-linux-gnu     # 64-bit little-endian (RISC-V)
           - wasm32-wasi           # 32-bit wasm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: install zig
         shell: bash
         run: |
@@ -78,5 +104,60 @@ jobs:
           mkdir -p "$HOME/zig"
           curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
           echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache
+          key: zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-
       - name: build for ${{ matrix.target }}
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+
+  # Random-input fuzzing (fuzz/main.zig): asserts no-crash, parse/encode
+  # round-trip equality, and Document byte-identity on every input. 200k
+  # iterations stays under a minute on CI.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache
+          key: zig-cache-fuzz-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-fuzz-${{ env.ZIG_VERSION }}-
+      - name: 200k iter fuzz
+        run: zig build fuzz -- 0 200000
+
+  # Microbenchmarks. Gates only that the harness builds and runs;
+  # the numbers are reported, not compared.
+  bench:
+    name: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache
+          key: zig-cache-bench-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-bench-${{ env.ZIG_VERSION }}-
+      - name: bench
+        run: zig build bench

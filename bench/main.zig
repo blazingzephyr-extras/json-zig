@@ -17,6 +17,7 @@
 //! total document size.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const json = @import("json");
 const bench_options = @import("bench_options");
@@ -88,6 +89,17 @@ pub fn main(init: std.process.Init) !void {
         fixtures[i] = try dir.readFileAlloc(io, name, static, .limited(max_fixture_bytes));
     }
 
+    std.debug.print(
+        "json microbenchmarks\n  zig:        {s}\n  optimize:   {t}\n  target:     {t}-{t}-{t}\n  cpu:        {s}\n\n",
+        .{
+            builtin.zig_version_string,
+            builtin.mode,
+            builtin.cpu.arch,
+            builtin.os.tag,
+            builtin.abi,
+            builtin.cpu.model.name,
+        },
+    );
     std.debug.print(
         "{s:<32} {s:>9} {s:>10} {s:>10} {s:>10} {s:>10} {s:>9}\n",
         .{ "benchmark", "size", "min", "p50", "p99", "max", "MB/s" },
