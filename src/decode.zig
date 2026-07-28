@@ -15,7 +15,7 @@
 //!     },
 //! };
 //!
-//! const cfg = try json.parseInto(Config, json.DefaultTypes, arena, src, .{});
+//! const cfg = try json.parseInto(Config, arena, src, .{});
 //! ```
 //!
 //! Field defaults satisfy missing-field cases. Optional fields (`?T`) become
@@ -29,6 +29,8 @@ const testing = std.testing;
 const value_mod = @import("value.zig");
 const Value = value_mod.Value;
 const parser_mod = @import("parser.zig");
+const codec_mod = @import("codec.zig");
+const AnnotationsSource = codec_mod.AnnotationsSource;
 const lev = @import("levenshtein.zig");
 
 pub const DecodeError = error{
@@ -87,9 +89,6 @@ const PathBuilder = struct {
 /// `@compileError` instead of silently never applying. Runs at the top of
 /// struct and tagged-union decoding (and typed encoding). Compile errors
 /// cannot be asserted from the test suite.
-///
-/// This does not TypeAnnotationProviders, because they are validated
-/// on creation during comptime.
 pub fn validateAnnotations(comptime T: type) void {
     comptime {
         const kind = if (@typeInfo(T) == .@"union") "variant" else "field";
@@ -118,84 +117,152 @@ pub fn validateAnnotations(comptime T: type) void {
 }
 
 /// Returns the effective JSON key for `field_name` on type `T`,
-/// consulting `T.json_rename` or `TAnnotation.json_rename` if present.
-pub fn renamedKey(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) []const u8 {
-    if (TAnnotation.getOrEmpty(T)) |a| {
-        if (a.json_rename) |r| {
-            comptime for (r) |rf| {
-                if (std.mem.eql(u8, rf.to, field_name)) return rf.from;
-            };
-        }
-    }
-    if (@hasDecl(T, "json_rename")) {
-        const r = T.json_rename;
-        if (@hasField(@TypeOf(r), field_name)) return @field(r, field_name);
-    }
-    return field_name;
+/// consulting `T.json_rename` or `Annotations(T).json_rename` if present.
+pub fn renamedKey(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime field_name: []const u8) []const u8 {
+    const renamed_key: ?[]const u8 = switch (codec_priority) {
+        .codec_only => codecRenamedKey(T, TCodec, field_name),
+        .codec_then_local => codecRenamedKey(T, TCodec, field_name) orelse localRenamedKey(T, field_name),
+        .local_then_codec => localRenamedKey(T, field_name) orelse codecRenamedKey(T, TCodec, field_name),
+        .local_only => localRenamedKey(T, field_name),
+    };
+    return renamed_key orelse field_name;
 }
 
-/// Returns the payload field name for tagged unions, consulting
-/// `T.json_payload` or `TAnnotation.json_payload` if present.
-pub fn payloadField(comptime T: type, comptime TAnnotation: type) ?[]const u8 {
-    if (TAnnotation.getOrEmpty(T)) |a| {
-        if (a.json_payload) |p| {
-            return p;
-        }
-    }
-    if (@hasDecl(T, "json_payload")) {
-        return T.json_payload;
+fn localRenamedKey(comptime T: type, comptime field_name: []const u8) ?[]const u8 {
+    if (!@hasDecl(T, "json_rename")) return null;
+    const renames = T.json_rename;
+    if (@hasField(@TypeOf(renames), field_name)) {
+        return @field(renames, field_name);
     }
     return null;
 }
 
-/// Returns true if `field_name` on type `T` is listed in `T.json_skip`
-/// or `TAnnotation.json_skip`.
-pub fn isSkipped(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) bool {
-    const skip = blk: {
-        if (TAnnotation.getOrEmpty(T)) |a| {
-            break :blk a.json_skip orelse &[_][]const u8{};
+fn codecRenamedKey(comptime T: type, comptime TCodec: type, comptime field_name: []const u8) ?[]const u8 {
+    if (TCodec.getOrEmpty(T)) |annotations| {
+        if (annotations.json_rename) |r| {
+            inline for (r) |rf| {
+                if (std.mem.eql(u8, rf.zig_name, field_name)) return rf.json_name;
+            }
         }
-        if (@hasDecl(T, "json_skip")) break :blk T.json_skip;
-        break :blk &[_][]const u8{};
-    };
+    }
+    return null;
+}
 
+/// Returns true if `field_name` on type `T` is listed in `T.json_skip`.
+pub fn isSkipped(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime field_name: []const u8) bool {
+    return switch (codec_priority) {
+        .codec_only => isCodecSkipped(T, TCodec, field_name),
+        .codec_then_local => isCodecSkipped(T, TCodec, field_name) or isLocalSkipped(T, field_name),
+        .local_then_codec => isLocalSkipped(T, field_name) or isCodecSkipped(T, TCodec, field_name),
+        .local_only => isLocalSkipped(T, field_name),
+    };
+}
+
+fn isLocalSkipped(comptime T: type, comptime field_name: []const u8) bool {
+    if (!@hasDecl(T, "json_skip")) return false;
+    const skip = T.json_skip;
     inline for (skip) |name| {
         if (comptime std.mem.eql(u8, name, field_name)) return true;
     }
     return false;
 }
 
-/// Returns true if `field_name` on type `T` is listed in `T.json_flatten`
-/// or `TAnnotation.json_flatten`.
-pub fn isFlattened(comptime T: type, comptime TAnnotation: type, comptime field_name: []const u8) bool {
-    const flat = blk: {
-        if (TAnnotation.getOrEmpty(T)) |a| {
-            break :blk a.json_flatten orelse &[_][]const u8{};
+fn isCodecSkipped(comptime T: type, comptime TCodec: type, comptime field_name: []const u8) bool {
+    if (TCodec.getOrEmpty(T)) |annotations| {
+        if (annotations.json_skip) |r| {
+            inline for (r) |rf| {
+                if (std.mem.eql(u8, rf, field_name)) return true;
+            }
         }
-        if (@hasDecl(T, "json_flatten")) break :blk T.json_flatten;
-        break :blk &[_][]const u8{};
-    };
+    }
+    return false;
+}
 
-    inline for (flat) |name| {
+/// Returns true if `field_name` on type `T` is listed in `T.json_flatten`.
+pub fn isFlattened(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime field_name: []const u8) bool {
+    return switch (codec_priority) {
+        .codec_only => isCodecFlattened(T, TCodec, field_name),
+        .codec_then_local => isCodecFlattened(T, TCodec, field_name) or isLocalFlattened(T, field_name),
+        .local_then_codec => isLocalFlattened(T, field_name) or isCodecFlattened(T, TCodec, field_name),
+        .local_only => isLocalFlattened(T, field_name),
+    };
+}
+
+fn isLocalFlattened(comptime T: type, comptime field_name: []const u8) bool {
+    if (!@hasDecl(T, "json_flatten")) return false;
+    const flatten = T.json_flatten;
+    inline for (flatten) |name| {
         if (comptime std.mem.eql(u8, name, field_name)) return true;
     }
     return false;
 }
 
+fn isCodecFlattened(comptime T: type, comptime TCodec: type, comptime field_name: []const u8) bool {
+    if (TCodec.getOrEmpty(T)) |annotations| {
+        if (annotations.json_flatten) |r| {
+            inline for (r) |rf| {
+                if (std.mem.eql(u8, rf, field_name)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Retrieves `json_tag` for tagged unions if exists on `T` or `Annotations(T)`.
+pub fn getJsonTag(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource) []const u8 {
+    const json_tag: ?[]const u8 = switch (codec_priority) {
+        .codec_only => codecJsonTag(T, TCodec),
+        .codec_then_local => codecJsonTag(T, TCodec) orelse localJsonTag(T),
+        .local_then_codec => localJsonTag(T) orelse codecJsonTag(T, TCodec),
+        .local_only => localJsonTag(T),
+    };
+    return json_tag orelse unreachable;
+}
+
+fn localJsonTag(comptime T: type) ?[]const u8 {
+    if (!@hasDecl(T, "json_tag")) return null;
+    return T.json_tag;
+}
+
+fn codecJsonTag(comptime T: type, comptime TCodec: type) ?[]const u8 {
+    const annotations = TCodec.getOrEmpty(T) orelse return null;
+    return annotations.json_tag;
+}
+
+/// Retrieves `json_payload` for tagged unions if exists on `T` or `Annotations(T)`.
+pub fn getJsonPayload(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource) ?[]const u8 {
+    return switch (codec_priority) {
+        .codec_only => codecJsonPayload(T, TCodec),
+        .codec_then_local => codecJsonPayload(T, TCodec) orelse localJsonPayload(T),
+        .local_then_codec => localJsonPayload(T) orelse codecJsonPayload(T, TCodec),
+        .local_only => localJsonPayload(T),
+    };
+}
+
+fn localJsonPayload(comptime T: type) ?[]const u8 {
+    if (!@hasDecl(T, "json_payload")) return null;
+    return T.json_payload;
+}
+
+fn codecJsonPayload(comptime T: type, comptime TCodec: type) ?[]const u8 {
+    const annotations = TCodec.getOrEmpty(T) orelse return null;
+    return annotations.json_payload;
+}
+
 /// Returns the full set of JSON keys that decoding `T` expects to see
 /// at the object's level -- i.e., renamed names for non-flattened fields,
 /// plus the expectedKeys of each flattened field's type (recursive).
-fn expectedKeys(comptime T: type, comptime TAnnotation: type) []const []const u8 {
+fn expectedKeys(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource) []const []const u8 {
     comptime {
         const s = @typeInfo(T).@"struct";
         var keys: []const []const u8 = &.{};
         for (s.fields) |field| {
-            if (isSkipped(T, TAnnotation, field.name)) continue;
-            if (isFlattened(T, TAnnotation, field.name)) {
-                const inner = expectedKeys(field.type, TAnnotation);
+            if (isSkipped(T, TCodec, codec_priority, field.name)) continue;
+            if (isFlattened(T, TCodec, codec_priority, field.name)) {
+                const inner = expectedKeys(field.type, TCodec, codec_priority);
                 keys = keys ++ inner;
             } else {
-                keys = keys ++ &[_][]const u8{renamedKey(T, TAnnotation, field.name)};
+                keys = keys ++ &[_][]const u8{renamedKey(T, TCodec, codec_priority, field.name)};
             }
         }
         return keys;
@@ -214,9 +281,9 @@ fn expectedKeys(comptime T: type, comptime TAnnotation: type) []const []const u8
 /// and decoded directly into the target. JSON `null` decodes only into
 /// optional targets; for any other target it errors like an absent field
 /// (`error.MissingField`).
-pub fn decode(comptime T: type, comptime TAnnotation: type, arena: Allocator, value: Value, options: parser_mod.ParseOptions) DecodeError!T {
+pub fn decode(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, arena: Allocator, value: Value, options: parser_mod.ParseOptions) DecodeError!T {
     var path: PathBuilder = .{ .buf = .empty };
-    return decodeInner(T, TAnnotation, arena, value, options, &path);
+    return decodeInner(T, TCodec, codec_priority, arena, value, options, &path);
 }
 
 /// Parse + decode in one call. See `decode` for the decoding rules.
@@ -226,46 +293,57 @@ pub fn decode(comptime T: type, comptime TAnnotation: type, arena: Allocator, va
 /// tree. On any error the input is re-decoded through the tree path, so
 /// diagnostics and error selection are always the canonical ones. Callers
 /// requesting `options.spans` use the tree path unconditionally.
-pub fn parseInto(comptime T: type, comptime TAnnotation: type, arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) (parser_mod.Error || DecodeError)!T {
-    if (comptime needsTree(T, TAnnotation)) return parseIntoTree(T, TAnnotation, arena, src, options);
-    if (options.spans != null) return parseIntoTree(T, TAnnotation, arena, src, options);
-    return streamParseInto(T, TAnnotation, arena, src, options) catch |err| switch (err) {
+pub fn parseInto(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) (parser_mod.Error || DecodeError)!T {
+    if (comptime needsTree(T, TCodec, codec_priority)) return parseIntoTree(T, TCodec, codec_priority, arena, src, options);
+    if (options.spans != null) return parseIntoTree(T, TCodec, codec_priority, arena, src, options);
+    return streamParseInto(T, TCodec, codec_priority, arena, src, options) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
-        else => parseIntoTree(T, TAnnotation, arena, src, options),
+        else => parseIntoTree(T, TCodec, codec_priority, arena, src, options),
     };
 }
 
-fn parseIntoTree(comptime T: type, comptime TAnnotation: type, arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) (parser_mod.Error || DecodeError)!T {
+fn parseIntoTree(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) (parser_mod.Error || DecodeError)!T {
     const value = try parser_mod.parse(arena, src, options);
-    return decode(T, TAnnotation, arena, value, options);
+    return decode(T, TCodec, codec_priority, arena, value, options);
 }
 
 /// Reader-input variant of `parseInto`: drains the reader into arena
 /// memory, then decodes the slice (streaming when the type allows).
-pub fn parseIntoReader(comptime T: type, comptime TAnnotation: type, arena: Allocator, reader: *std.Io.Reader, options: parser_mod.ParseOptions) (parser_mod.ReaderError || DecodeError)!T {
+pub fn parseIntoReader(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, arena: Allocator, reader: *std.Io.Reader, options: parser_mod.ParseOptions) (parser_mod.ReaderError || DecodeError)!T {
     const input = try reader.allocRemaining(arena, .unlimited);
-    return parseInto(T, TAnnotation, arena, input, options);
+    return parseInto(T, TCodec, codec_priority, arena, input, options);
 }
 
-fn decodeInner(comptime T: type, comptime TAnnotation: type, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
+fn FromJsonCb(comptime T: type) type {
+    return *const fn (arena: Allocator, value: Value, options: parser_mod.ParseOptions) DecodeError!T;
+}
+
+fn getFromJsonCb(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource) ?FromJsonCb(T) {
+    return switch (codec_priority) {
+        .codec_only => codecFromJsonCb(T, TCodec),
+        .codec_then_local => codecFromJsonCb(T, TCodec) orelse localFromJsonCb(T),
+        .local_then_codec => localFromJsonCb(T) orelse codecFromJsonCb(T, TCodec),
+        .local_only => localFromJsonCb(T),
+    };
+}
+
+fn localFromJsonCb(comptime T: type) ?FromJsonCb(T) {
+    if (!@hasDecl(T, "fromJson")) return null;
+    return T.fromJson;
+}
+
+fn codecFromJsonCb(comptime T: type, comptime TCodec: type) ?FromJsonCb(T) {
+    const annotations = TCodec.getOrEmpty(T) orelse return null;
+    return annotations.fromJson;
+}
+
+fn decodeInner(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
     if (T == Value) return value;
 
     // Custom fromJson hook short-circuit.
     if (comptime (@typeInfo(T) == .@"struct")) {
-        if (@hasDecl(T, "fromJson")) {
-            comptime {
-                const fn_info = @typeInfo(@TypeOf(T.fromJson)).@"fn";
-                if (fn_info.params.len != 3) {
-                    @compileError(@typeName(T) ++ ".fromJson must take exactly 3 params: (Allocator, Value, ParseOptions)");
-                }
-            }
-            return T.fromJson(arena, value, options);
-        }
-
-        if (comptime (TAnnotation.getOrEmpty(T))) |provider| {
-            if (provider.fromJson) |fromJson| {
-                return fromJson(arena, value, options);
-            }
+        if (comptime (getFromJsonCb(T, TCodec, codec_priority))) |cb| {
+            return cb(arena, value, options);
         }
     }
 
@@ -283,18 +361,19 @@ fn decodeInner(comptime T: type, comptime TAnnotation: type, arena: Allocator, v
     }
 
     // Tagged-union dispatch.
-    if (comptime (@typeInfo(T) == .@"union" and (@hasDecl(T, "json_tag") or (TAnnotation.has(T) and TAnnotation.get(T).json_tag != null)))) {
-        return decodeTaggedUnion(T, TAnnotation, arena, value, options, path);
+    if (comptime (@typeInfo(T) == .@"union")) {
+        const tag = comptime getJsonTag(T, TCodec, codec_priority);
+        return decodeTaggedUnion(T, TCodec, codec_priority, tag, arena, value, options, path);
     }
 
     return switch (@typeInfo(T)) {
         .bool => decodeBool(value, arena, options, path),
         .int => decodeInt(T, value, arena, options, path),
         .float => decodeFloat(T, value, arena, options, path),
-        .pointer => |p| decodePointer(T, TAnnotation, p, arena, value, options, path),
-        .array => |a| decodeArray(T, TAnnotation, a, arena, value, options, path),
-        .optional => |o| decodeOptional(o.child, TAnnotation, arena, value, options, path),
-        .@"struct" => |s| decodeStruct(T, TAnnotation, s, arena, value, options, path),
+        .pointer => |p| decodePointer(T, TCodec, codec_priority, p, arena, value, options, path),
+        .array => |a| decodeArray(T, TCodec, codec_priority, a, arena, value, options, path),
+        .optional => |o| decodeOptional(o.child, TCodec, codec_priority, arena, value, options, path),
+        .@"struct" => |s| decodeStruct(T, TCodec, codec_priority, s, arena, value, options, path),
         .@"enum" => decodeEnum(T, value, arena, options, path),
         else => @compileError("json decode: unsupported type " ++ @typeName(T)),
     };
@@ -386,7 +465,7 @@ fn decodeFloat(comptime T: type, value: Value, arena: Allocator, options: parser
     };
 }
 
-fn decodePointer(comptime T: type, comptime TAnnotation: type, comptime p: std.builtin.Type.Pointer, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
+fn decodePointer(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime p: std.builtin.Type.Pointer, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
     if (p.size != .slice) @compileError("json decode: only slice pointers supported, got " ++ @typeName(T));
     if (p.child == u8 and p.is_const) {
         if (value != .string) {
@@ -410,12 +489,12 @@ fn decodePointer(comptime T: type, comptime TAnnotation: type, comptime p: std.b
     for (items, 0..) |item, i| {
         const prev = try path.pushIndex(arena, i);
         defer path.restore(prev);
-        out[i] = try decodeInner(p.child, TAnnotation, arena, item, options, path);
+        out[i] = try decodeInner(p.child, TCodec, codec_priority, arena, item, options, path);
     }
     return out;
 }
 
-fn decodeArray(comptime T: type, comptime TAnnotation: type, comptime a: std.builtin.Type.Array, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
+fn decodeArray(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime a: std.builtin.Type.Array, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
     if (value != .array) {
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "expected array, got {s}", .{@tagName(value)});
@@ -437,18 +516,18 @@ fn decodeArray(comptime T: type, comptime TAnnotation: type, comptime a: std.bui
         for (value.array, 0..) |item, i| {
             const prev = try path.pushIndex(arena, i);
             defer path.restore(prev);
-            out[i] = try decodeInner(a.child, TAnnotation, arena, item, options, path);
+            out[i] = try decodeInner(a.child, TCodec, codec_priority, arena, item, options, path);
         }
     }
     return out;
 }
 
-fn decodeOptional(comptime Child: type, comptime TAnnotation: type, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!?Child {
+fn decodeOptional(comptime Child: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!?Child {
     if (value == .null) return null;
-    return try decodeInner(Child, TAnnotation, arena, value, options, path);
+    return try decodeInner(Child, TCodec, codec_priority, arena, value, options, path);
 }
 
-fn decodeStruct(comptime T: type, comptime TAnnotation: type, comptime s: std.builtin.Type.Struct, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
+fn decodeStruct(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime s: std.builtin.Type.Struct, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
     comptime validateAnnotations(T);
     if (value != .object) {
         if (options.errors) |list| {
@@ -465,12 +544,12 @@ fn decodeStruct(comptime T: type, comptime TAnnotation: type, comptime s: std.bu
     if (!options.ignore_unknown_fields) {
         var it = obj.iterator();
         outer: while (it.next()) |entry| {
-            inline for (comptime expectedKeys(T, TAnnotation)) |expected| {
+            inline for (comptime expectedKeys(T, TCodec, codec_priority)) |expected| {
                 if (std.mem.eql(u8, entry.key_ptr.*, expected)) continue :outer;
             }
             // Unknown key. Try a suggestion.
             const key = entry.key_ptr.*;
-            const suggestion = lev.closestMatch(key, comptime expectedKeys(T, TAnnotation), lev.suggestionThreshold(key.len));
+            const suggestion = lev.closestMatch(key, comptime expectedKeys(T, TCodec, codec_priority), lev.suggestionThreshold(key.len));
 
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "unknown field `{s}`", .{key});
@@ -484,11 +563,11 @@ fn decodeStruct(comptime T: type, comptime TAnnotation: type, comptime s: std.bu
     var out: T = undefined;
 
     inline for (s.fields) |field| {
-        if (comptime isSkipped(T, TAnnotation, field.name)) {
+        if (comptime isSkipped(T, TCodec, codec_priority, field.name)) {
             const dv = comptime field.defaultValue() orelse
                 @compileError("json_skip field `" ++ field.name ++ "` on " ++ @typeName(T) ++ " has no default value");
             @field(out, field.name) = dv;
-        } else if (comptime isFlattened(T, TAnnotation, field.name)) {
+        } else if (comptime isFlattened(T, TCodec, codec_priority, field.name)) {
             // Decode the inner struct from the SAME parent value (no key lookup).
             // The parent's expectedKeys already validated all keys, so suppress
             // unknown-field errors in the inner struct to avoid false positives
@@ -497,13 +576,13 @@ fn decodeStruct(comptime T: type, comptime TAnnotation: type, comptime s: std.bu
             defer path.restore(prev);
             var flat_opts = options;
             flat_opts.ignore_unknown_fields = true;
-            @field(out, field.name) = try decodeInner(field.type, TAnnotation, arena, value, flat_opts, path);
+            @field(out, field.name) = try decodeInner(field.type, TCodec, codec_priority, arena, value, flat_opts, path);
         } else {
-            const eff_key = comptime renamedKey(T, TAnnotation, field.name);
+            const eff_key = comptime renamedKey(T, TCodec, codec_priority, field.name);
             if (obj.get(eff_key)) |fv| {
                 const prev = try path.pushSegment(arena, eff_key);
                 defer path.restore(prev);
-                @field(out, field.name) = try decodeInner(field.type, TAnnotation, arena, fv, options, path);
+                @field(out, field.name) = try decodeInner(field.type, TCodec, codec_priority, arena, fv, options, path);
             } else if (field.defaultValue()) |dv| {
                 @field(out, field.name) = dv;
             } else if (@typeInfo(field.type) == .optional) {
@@ -522,18 +601,39 @@ fn decodeStruct(comptime T: type, comptime TAnnotation: type, comptime s: std.bu
 }
 
 /// Effective (renamed) wire names of every variant of union `T`.
-fn variantNames(comptime T: type, comptime TAnnotation: type) []const []const u8 {
+fn variantNames(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource) []const []const u8 {
     comptime {
         var names: []const []const u8 = &.{};
         for (@typeInfo(T).@"union".fields) |field| {
-            names = names ++ &[_][]const u8{renamedKey(T, TAnnotation, field.name)};
+            names = names ++ &[_][]const u8{renamedKey(T, TCodec, codec_priority, field.name)};
         }
         return names;
     }
 }
 
-fn decodeTaggedUnion(comptime T: type, comptime TAnnotation: type, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
+/// Comptime: every non-void union payload must be struct-shaped when
+/// `json_payload` is absent (its fields are read directly off the wrapper
+/// object alongside the discriminator). With `json_payload` set, a payload
+/// may be any type `decodeInner` supports, since it decodes from its own
+/// isolated JSON value rather than being flattened into the wrapper.
+fn validateTaggedUnionPayloads(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource) void {
+    comptime {
+        const has_payload_field = getJsonPayload(T, TCodec, codec_priority) != null;
+        if (has_payload_field) return;
+        for (@typeInfo(T).@"union".fields) |f| {
+            if (f.type == void) continue;
+            if (@typeInfo(f.type) != .@"struct") {
+                @compileError("json decode: variant `" ++ f.name ++ "` of " ++ @typeName(T) ++
+                    " has non-struct payload " ++ @typeName(f.type) ++
+                    " but no json_payload is set -- either give the union a json_payload field or make every non-void variant a struct");
+            }
+        }
+    }
+}
+
+fn decodeTaggedUnion(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime tag_field: []const u8, arena: Allocator, value: Value, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
     comptime validateAnnotations(T);
+    comptime validateTaggedUnionPayloads(T, TCodec, codec_priority);
     if (value != .object) {
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "expected object for {s}, got {s}", .{ @typeName(T), @tagName(value) });
@@ -542,14 +642,6 @@ fn decodeTaggedUnion(comptime T: type, comptime TAnnotation: type, arena: Alloca
         return error.TypeMismatch;
     }
     const obj = value.object;
-
-    const tag_field = comptime if (TAnnotation.getOrEmpty(T)) |a| block: {
-        if (a.json_tag) |json_tag| {
-            break :block json_tag;
-        }
-        break :block T.json_tag;
-    } else T.json_tag;
-
     const tag_value = obj.get(tag_field) orelse {
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "missing discriminator field `{s}` for {s}", .{ tag_field, @typeName(T) });
@@ -565,9 +657,11 @@ fn decodeTaggedUnion(comptime T: type, comptime TAnnotation: type, arena: Alloca
         return error.TypeMismatch;
     }
 
+    const json_payload = comptime getJsonPayload(T, TCodec, codec_priority);
+
     inline for (@typeInfo(T).@"union".fields) |union_field| {
         const variant_name = union_field.name;
-        const effective_name = comptime renamedKey(T, TAnnotation, variant_name);
+        const effective_name = comptime renamedKey(T, TCodec, codec_priority, variant_name);
         if (std.mem.eql(u8, tag_value.string, effective_name)) {
             const PayloadType = union_field.type;
 
@@ -575,40 +669,54 @@ fn decodeTaggedUnion(comptime T: type, comptime TAnnotation: type, arena: Alloca
                 return @unionInit(T, variant_name, {});
             }
 
-            // Build a filtered object view that drops the discriminator field.
-            var filtered: value_mod.ObjectMap = .empty;
-            var it = if (payloadField(T, TAnnotation)) |json_payload| blk: {
-                if (obj.get(json_payload)) |p| {
-                    if (p != .object) {
-                        if (options.errors) |list| {
-                            const msg = try std.fmt.allocPrint(arena, "expected object for {s}, got {s}", .{ @typeName(T), @tagName(value) });
-                            try appendDiag(list, arena, path, msg, null);
-                        }
-                        return error.TypeMismatch;
-                    }
-                    break :blk p.object.iterator();
-                } else {
+            const payload_value = if (comptime json_payload) |jp| blk: {
+                // Separate payload field: the payload is decoded directly from
+                // its own JSON value, so PayloadType may be anything decodeInner
+                // supports (scalar, slice, struct, nested union, ...). Any
+                // TypeMismatch decodeInner reports will describe THIS value's
+                // own kind, not the wrapper object's.
+                const p = obj.get(jp) orelse {
                     if (options.errors) |list| {
-                        const msg = try std.fmt.allocPrint(arena, "missing payload field `{s}` for {s}", .{ json_payload, @typeName(T) });
+                        const msg = try std.fmt.allocPrint(arena, "missing payload field `{s}` for {s}", .{ jp, @typeName(T) });
                         try appendDiag(list, arena, path, msg, null);
                     }
                     return error.MissingField;
+                };
+                if (!options.ignore_unknown_fields) {
+                    var it = obj.iterator();
+                    while (it.next()) |entry| {
+                        const key = entry.key_ptr.*;
+                        if (std.mem.eql(u8, key, tag_field)) continue;
+                        if (std.mem.eql(u8, key, jp)) continue;
+                        if (options.errors) |list| {
+                            const msg = try std.fmt.allocPrint(arena, "unknown field `{s}` for {s}", .{ key, @typeName(T) });
+                            try appendDiag(list, arena, path, msg, null);
+                        }
+                        return error.UnknownField;
+                    }
                 }
-            } else obj.iterator();
+                break :blk p;
+            } else blk: {
+                // No json_payload: validateTaggedUnionPayloads already
+                // guarantees PayloadType is a struct, so its fields are read
+                // directly off the wrapper (minus the discriminator).
+                var filtered: value_mod.ObjectMap = .empty;
+                var it = obj.iterator();
+                while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, tag_field)) continue;
+                    const key_dup = try arena.dupe(u8, entry.key_ptr.*);
+                    try filtered.put(arena, key_dup, entry.value_ptr.*);
+                }
+                break :blk Value{ .object = filtered };
+            };
 
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, entry.key_ptr.*, tag_field)) continue;
-                const key_dup = try arena.dupe(u8, entry.key_ptr.*);
-                try filtered.put(arena, key_dup, entry.value_ptr.*);
-            }
-            const filtered_value = Value{ .object = filtered };
-            const payload = try decodeInner(PayloadType, TAnnotation, arena, filtered_value, options, path);
+            const payload = try decodeInner(PayloadType, TCodec, codec_priority, arena, payload_value, options, path);
             return @unionInit(T, variant_name, payload);
         }
     }
     if (options.errors) |list| {
         const tag = tag_value.string;
-        const suggestion = lev.closestMatch(tag, comptime variantNames(T, TAnnotation), lev.suggestionThreshold(tag.len));
+        const suggestion = lev.closestMatch(tag, comptime variantNames(T, TCodec, codec_priority), lev.suggestionThreshold(tag.len));
         const msg = try std.fmt.allocPrint(arena, "unknown variant `{s}` for {s}", .{ tag, @typeName(T) });
         const suggestion_owned: ?[]const u8 = if (suggestion) |s_str| try arena.dupe(u8, s_str) else null;
         try appendDiag(list, arena, path, msg, suggestion_owned);
@@ -655,35 +763,31 @@ const RawToken = tokenizer_mod.RawToken;
 /// payload), flattened non-struct fields, and effective-key collisions
 /// between a struct and its flattened fields. Those decode through the
 /// tree path; everything else streams token-to-field.
-fn needsTree(comptime T: type, comptime TAnnotation: type) bool {
-    return comptime needsTreeImpl(T, TAnnotation, &.{});
+fn needsTree(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource) bool {
+    return comptime needsTreeImpl(T, TCodec, codec_priority, &.{});
 }
 
-fn needsTreeImpl(comptime T: type, comptime TAnnotation: type, comptime seen: []const type) bool {
+fn needsTreeImpl(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime seen: []const type) bool {
     comptime {
         for (seen) |S| if (S == T) return false;
         if (T == Value) return true;
         const seen2 = seen ++ &[_]type{T};
         return switch (@typeInfo(T)) {
             .@"struct" => |s| blk: {
-                if (@hasDecl(T, "fromJson")) break :blk true;
-                if (TAnnotation.getOrEmpty(T)) |a| {
-                    if (a.fromJson) break :blk true;
-                }
-
+                if (getFromJsonCb(T, TCodec, codec_priority) != null) break :blk true;
                 for (s.fields) |f| {
-                    if (isFlattened(T, TAnnotation, f.name) and @typeInfo(f.type) != .@"struct") break :blk true;
+                    if (isFlattened(T, TCodec, codec_priority, f.name) and @typeInfo(f.type) != .@"struct") break :blk true;
                 }
-                if (hasKeyCollisions(T, TAnnotation)) break :blk true;
+                if (hasKeyCollisions(T, TCodec, codec_priority)) break :blk true;
                 for (s.fields) |f| {
-                    if (needsTreeImpl(f.type, TAnnotation, seen2)) break :blk true;
+                    if (needsTreeImpl(f.type, TCodec, codec_priority, seen2)) break :blk true;
                 }
                 break :blk false;
             },
             .@"union" => true,
-            .pointer => |p| p.size == .slice and !(p.child == u8 and p.is_const) and needsTreeImpl(p.child, TAnnotation, seen2),
-            .array => |a| needsTreeImpl(a.child, TAnnotation, seen2),
-            .optional => |o| needsTreeImpl(o.child, TAnnotation, seen2),
+            .pointer => |p| p.size == .slice and !(p.child == u8 and p.is_const) and needsTreeImpl(p.child, TCodec, codec_priority, seen2),
+            .array => |a| needsTreeImpl(a.child, TCodec, codec_priority, seen2),
+            .optional => |o| needsTreeImpl(o.child, TCodec, codec_priority, seen2),
             else => false,
         };
     }
@@ -700,16 +804,16 @@ const EffField = struct {
 
 /// Effective field list of `T` with flattened inner structs expanded,
 /// skipped fields excluded. Mirrors `expectedKeys` exactly.
-fn effFieldsOf(comptime T: type, comptime TAnnotation: type, comptime prefix: []const []const u8) []const EffField {
+fn effFieldsOf(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime prefix: []const []const u8) []const EffField {
     comptime {
         var out: []const EffField = &.{};
         for (@typeInfo(T).@"struct".fields) |f| {
-            if (isSkipped(T, TAnnotation, f.name)) continue;
+            if (isSkipped(T, TCodec, codec_priority, f.name)) continue;
             const p2 = prefix ++ &[_][]const u8{f.name};
-            if (isFlattened(T, TAnnotation, f.name)) {
-                out = out ++ effFieldsOf(f.type, TAnnotation, p2);
+            if (isFlattened(T, TCodec, codec_priority, f.name)) {
+                out = out ++ effFieldsOf(f.type, TCodec, codec_priority, p2);
             } else {
-                out = out ++ &[_]EffField{.{ .key = renamedKey(T, TAnnotation, f.name), .path = p2, .Type = f.type }};
+                out = out ++ &[_]EffField{.{ .key = renamedKey(T, TCodec, codec_priority, f.name), .path = p2, .Type = f.type }};
             }
         }
         return out;
@@ -719,9 +823,9 @@ fn effFieldsOf(comptime T: type, comptime TAnnotation: type, comptime prefix: []
 /// Two effective fields sharing one wire key (an outer field colliding
 /// with a flattened inner one). The tree path decodes such a key into
 /// every destination; a single token stream cannot, so collide -> tree.
-fn hasKeyCollisions(comptime T: type, comptime TAnnotation: type) bool {
+fn hasKeyCollisions(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource) bool {
     comptime {
-        const fs = effFieldsOf(T, TAnnotation, &.{});
+        const fs = effFieldsOf(T, TCodec, codec_priority, &.{});
         for (fs, 0..) |a, i| {
             for (fs[i + 1 ..]) |b| {
                 if (std.mem.eql(u8, a.key, b.key)) return true;
@@ -746,14 +850,14 @@ fn pathPtr(comptime T: type, comptime path: []const []const u8, base: *T) *PathT
 
 /// Assign defaults to every `json_skip` field of `T`, recursing through
 /// flattened inner structs. Mirrors the skip branch of `decodeStruct`.
-fn assignSkippedDefaults(comptime T: type, comptime TAnnotation: type, comptime prefix: []const []const u8, comptime Outer: type, out: *Outer) void {
+fn assignSkippedDefaults(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime prefix: []const []const u8, comptime Outer: type, out: *Outer) void {
     inline for (@typeInfo(T).@"struct".fields) |f| {
-        if (comptime isSkipped(T, TAnnotation, f.name)) {
+        if (comptime isSkipped(T, TCodec, codec_priority, f.name)) {
             const dv = comptime f.defaultValue() orelse
                 @compileError("json_skip field `" ++ f.name ++ "` on " ++ @typeName(T) ++ " has no default value");
             pathPtr(Outer, prefix ++ &[_][]const u8{f.name}, out).* = dv;
-        } else if (comptime isFlattened(T, TAnnotation, f.name)) {
-            assignSkippedDefaults(f.type, TAnnotation, prefix ++ &[_][]const u8{f.name}, Outer, out);
+        } else if (comptime isFlattened(T, TCodec, codec_priority, f.name)) {
+            assignSkippedDefaults(f.type, TCodec, codec_priority, prefix ++ &[_][]const u8{f.name}, Outer, out);
         }
     }
 }
@@ -763,7 +867,7 @@ fn assignSkippedDefaults(comptime T: type, comptime TAnnotation: type, comptime 
 /// same scalar decoders, same skip validation via `parseValue`); every
 /// error abandons the pass and the caller reruns the tree path, whose
 /// error selection and diagnostics are canonical.
-fn streamParseInto(comptime T: type, comptime TAnnotation: type, arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) (parser_mod.Error || DecodeError)!T {
+fn streamParseInto(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) (parser_mod.Error || DecodeError)!T {
     var stream_options = options;
     stream_options.errors = null;
     stream_options.spans = null;
@@ -774,16 +878,16 @@ fn streamParseInto(comptime T: type, comptime TAnnotation: type, arena: Allocato
         .options = stream_options,
     };
     const t = (try p.next()) orelse return error.JsonParseError;
-    const out = try streamValue(T, TAnnotation, &p, t, 0);
+    const out = try streamValue(T, TCodec, codec_priority, &p, t, 0);
     if (try p.next()) |_| return error.JsonParseError;
     return out;
 }
 
-fn streamValue(comptime T: type, comptime TAnnotation: type, p: *parser_mod.Parser, t: RawToken, depth: usize) (parser_mod.Error || DecodeError)!T {
+fn streamValue(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, p: *parser_mod.Parser, t: RawToken, depth: usize) (parser_mod.Error || DecodeError)!T {
     const info = @typeInfo(T);
     if (comptime info == .optional) {
         if (t.kind == .literal_null) return null;
-        return try streamValue(info.optional.child, TAnnotation, p, t, depth);
+        return try streamValue(info.optional.child, TCodec, codec_priority, p, t, depth);
     }
     // JSON null into a non-optional mirrors decodeInner's policy.
     if (t.kind == .literal_null) return error.MissingField;
@@ -812,14 +916,14 @@ fn streamValue(comptime T: type, comptime TAnnotation: type, p: *parser_mod.Pars
             .number => try decodeEnum(T, try p.parseNumber(t), p.arena, p.options, &path),
             else => error.TypeMismatch,
         },
-        .pointer => |ptr| try streamPointer(T, TAnnotation, ptr, p, t, depth),
-        .array => |arr| try streamFixedArray(T, TAnnotation, arr, p, t, depth),
-        .@"struct" => try streamStruct(T, TAnnotation, p, t, depth),
+        .pointer => |ptr| try streamPointer(T, TCodec, codec_priority, ptr, p, t, depth),
+        .array => |arr| try streamFixedArray(T, TCodec, codec_priority, arr, p, t, depth),
+        .@"struct" => try streamStruct(T, TCodec, codec_priority, p, t, depth),
         else => @compileError("json decode: unsupported type " ++ @typeName(T)),
     };
 }
 
-fn streamPointer(comptime T: type, comptime TAnnotation: type, comptime ptr: std.builtin.Type.Pointer, p: *parser_mod.Parser, t: RawToken, depth: usize) (parser_mod.Error || DecodeError)!T {
+fn streamPointer(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime ptr: std.builtin.Type.Pointer, p: *parser_mod.Parser, t: RawToken, depth: usize) (parser_mod.Error || DecodeError)!T {
     if (comptime ptr.size != .slice) @compileError("json decode: only slice pointers supported, got " ++ @typeName(T));
     if (comptime (ptr.child == u8 and ptr.is_const)) {
         if (t.kind != .string) return error.TypeMismatch;
@@ -836,7 +940,7 @@ fn streamPointer(comptime T: type, comptime TAnnotation: type, comptime ptr: std
             return error.JsonParseError;
         }
         at_first = false;
-        try items.append(p.arena, try streamValue(ptr.child, TAnnotation, p, et, depth + 1));
+        try items.append(p.arena, try streamValue(ptr.child, TCodec, codec_priority, p, et, depth + 1));
         const sep = (try p.next()) orelse return error.JsonParseError;
         if (sep.kind == .array_end) break;
         if (sep.kind != .comma) return error.JsonParseError;
@@ -844,7 +948,7 @@ fn streamPointer(comptime T: type, comptime TAnnotation: type, comptime ptr: std
     return items.toOwnedSlice(p.arena);
 }
 
-fn streamFixedArray(comptime T: type, comptime TAnnotation: type, comptime arr: std.builtin.Type.Array, p: *parser_mod.Parser, t: RawToken, depth: usize) (parser_mod.Error || DecodeError)!T {
+fn streamFixedArray(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, comptime arr: std.builtin.Type.Array, p: *parser_mod.Parser, t: RawToken, depth: usize) (parser_mod.Error || DecodeError)!T {
     if (t.kind != .array_begin) return error.TypeMismatch;
     if (depth >= p.depthLimit()) return error.NestingTooDeep;
     var out: T = undefined;
@@ -859,7 +963,7 @@ fn streamFixedArray(comptime T: type, comptime TAnnotation: type, comptime arr: 
         at_first = false;
         if (comptime arr.len == 0) return error.TypeMismatch;
         if (i >= arr.len) return error.TypeMismatch;
-        out[i] = try streamValue(arr.child, TAnnotation, p, et, depth + 1);
+        out[i] = try streamValue(arr.child, TCodec, codec_priority, p, et, depth + 1);
         i += 1;
         const sep = (try p.next()) orelse return error.JsonParseError;
         if (sep.kind == .array_end) break;
@@ -869,15 +973,15 @@ fn streamFixedArray(comptime T: type, comptime TAnnotation: type, comptime arr: 
     return out;
 }
 
-fn streamStruct(comptime T: type, comptime TAnnotation: type, p: *parser_mod.Parser, t: RawToken, depth: usize) (parser_mod.Error || DecodeError)!T {
+fn streamStruct(comptime T: type, comptime TCodec: type, comptime codec_priority: AnnotationsSource, p: *parser_mod.Parser, t: RawToken, depth: usize) (parser_mod.Error || DecodeError)!T {
     comptime validateAnnotations(T);
     if (t.kind != .object_begin) return error.TypeMismatch;
     if (depth >= p.depthLimit()) return error.NestingTooDeep;
 
-    const eff = comptime effFieldsOf(T, TAnnotation, &.{});
+    const eff = comptime effFieldsOf(T, TCodec, codec_priority, &.{});
     var seen = [_]bool{false} ** eff.len;
     var out: T = undefined;
-    assignSkippedDefaults(T, TAnnotation, &.{}, T, &out);
+    assignSkippedDefaults(T, TCodec, codec_priority, &.{}, T, &out);
 
     var at_first = true;
     while (true) {
@@ -898,7 +1002,7 @@ fn streamStruct(comptime T: type, comptime TAnnotation: type, p: *parser_mod.Par
             if (!matched and std.mem.eql(u8, key, f.key)) {
                 // Duplicate keys re-decode and overwrite: last wins,
                 // matching the tree parser's object semantics.
-                pathPtr(T, f.path, &out).* = try streamValue(f.Type, TAnnotation, p, vt, depth + 1);
+                pathPtr(T, f.path, &out).* = try streamValue(f.Type, TCodec, codec_priority, p, vt, depth + 1);
                 seen[idx] = true;
                 matched = true;
             }
@@ -938,8 +1042,7 @@ fn streamStruct(comptime T: type, comptime TAnnotation: type, p: *parser_mod.Par
 }
 
 const parse = @import("parser.zig").parse;
-const annotation = @import("annotation.zig");
-const DefaultTypes = annotation.DefaultTypes;
+const TypedCodec = codec_mod.TypedCodec;
 
 test "decode struct with defaults optionals slices enums" {
     const Config = struct {
@@ -953,7 +1056,7 @@ test "decode struct with defaults optionals slices enums" {
     };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    const cfg = try parseInto(Config, DefaultTypes, ar.allocator(),
+    const cfg = try parseInto(Config, TypedCodec(.{}), .local_only, ar.allocator(),
         \\{"title":"t","nick":null,"ratio":1.5,"tags":["a"],"mode":"fast",
         \\ "server":{"host":"h"}}
     , .{});
@@ -968,8 +1071,8 @@ test "unknown field errors with did-you-mean; opt-out flag" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try std.testing.expectError(error.UnknownField, parseInto(C, DefaultTypes, a, "{\"prot\":2}", .{}));
-    const c = try parseInto(C, DefaultTypes, a, "{\"prot\":2}", .{ .ignore_unknown_fields = true });
+    try std.testing.expectError(error.UnknownField, parseInto(C, TypedCodec(.{}), .local_only, a, "{\"prot\":2}", .{}));
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, a, "{\"prot\":2}", .{ .ignore_unknown_fields = true });
     try std.testing.expectEqual(@as(u16, 1), c.port);
 }
 
@@ -977,7 +1080,7 @@ test "int overflow checked" {
     const C = struct { n: u8 };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    try std.testing.expectError(error.Overflow, parseInto(C, DefaultTypes, ar.allocator(), "{\"n\":256}", .{}));
+    try std.testing.expectError(error.Overflow, parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"n\":256}", .{}));
 }
 
 test "json_rename json_skip json_flatten" {
@@ -991,7 +1094,7 @@ test "json_rename json_skip json_flatten" {
     };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, ar.allocator(), "{\"listen-addr\":\"x\",\"verbose\":true}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"listen-addr\":\"x\",\"verbose\":true}", .{});
     try std.testing.expectEqualStrings("x", c.listen_addr);
     try std.testing.expectEqual(@as(u32, 7), c.runtime);
     try std.testing.expectEqual(true, c.common.verbose);
@@ -1005,7 +1108,7 @@ test "json_tag tagged union" {
     };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    const p_ = try parseInto(Plugin, DefaultTypes, ar.allocator(), "{\"kind\":\"http\",\"port\":80}", .{});
+    const p_ = try parseInto(Plugin, TypedCodec(.{}), .local_only, ar.allocator(), "{\"kind\":\"http\",\"port\":80}", .{});
     try std.testing.expectEqual(@as(u16, 80), p_.http.port);
 }
 
@@ -1014,7 +1117,7 @@ test "parseIntoReader decodes from a reader" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     var r: std.Io.Reader = .fixed("{\"port\":8080}");
-    const c = try parseIntoReader(C, DefaultTypes, ar.allocator(), &r, .{});
+    const c = try parseIntoReader(C, TypedCodec(.{}), .local_only, ar.allocator(), &r, .{});
     try testing.expectEqual(@as(u16, 8080), c.port);
 }
 
@@ -1022,7 +1125,7 @@ test "decode null into non-optional field is MissingField" {
     const C = struct { n: u32 };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.MissingField, parseInto(C, DefaultTypes, ar.allocator(), "{\"n\":null}", .{}));
+    try testing.expectError(error.MissingField, parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"n\":null}", .{}));
 }
 
 test "decode null/optional matrix" {
@@ -1034,7 +1137,7 @@ test "decode null/optional matrix" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"a\":null,\"c\":3}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"a\":null,\"c\":3}", .{});
     try testing.expectEqual(@as(?u32, null), c.a);
     try testing.expectEqual(@as(?u32, null), c.b);
     try testing.expectEqual(@as(?u32, 3), c.c);
@@ -1045,7 +1148,7 @@ test "decode float field accepts integer value" {
     const C = struct { x: f32, y: f64 };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"x\":3,\"y\":-7}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"x\":3,\"y\":-7}", .{});
     try testing.expectEqual(@as(f32, 3.0), c.x);
     try testing.expectEqual(@as(f64, -7.0), c.y);
 }
@@ -1055,9 +1158,9 @@ test "decode int field rejects float value" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try testing.expectError(error.TypeMismatch, parseInto(C, DefaultTypes, a, "{\"n\":1.5}", .{}));
+    try testing.expectError(error.TypeMismatch, parseInto(C, TypedCodec(.{}), .local_only, a, "{\"n\":1.5}", .{}));
     // 1e2 lexes as .float and stays one; it never decodes into an int.
-    try testing.expectError(error.TypeMismatch, parseInto(C, DefaultTypes, a, "{\"n\":1e2}", .{}));
+    try testing.expectError(error.TypeMismatch, parseInto(C, TypedCodec(.{}), .local_only, a, "{\"n\":1e2}", .{}));
 }
 
 test "decode int and float fields in raw number mode" {
@@ -1065,7 +1168,7 @@ test "decode int and float fields in raw number mode" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const c = try parseInto(C, DefaultTypes, a, "{\"n\":42,\"x\":1.5,\"big\":9000000000}", .{ .number_mode = .raw });
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, a, "{\"n\":42,\"x\":1.5,\"big\":9000000000}", .{ .number_mode = .raw });
     try testing.expectEqual(@as(u32, 42), c.n);
     try testing.expectEqual(@as(f64, 1.5), c.x);
     try testing.expectEqual(@as(i64, 9000000000), c.big);
@@ -1073,9 +1176,9 @@ test "decode int and float fields in raw number mode" {
     // Raw mode keeps typed-mode's policy: a float lexeme is not an int,
     // and an out-of-range integer lexeme overflows.
     const D = struct { n: u32 };
-    try testing.expectError(error.TypeMismatch, parseInto(D, DefaultTypes, a, "{\"n\":1.5}", .{ .number_mode = .raw }));
-    try testing.expectError(error.TypeMismatch, parseInto(D, DefaultTypes, a, "{\"n\":1e2}", .{ .number_mode = .raw }));
-    try testing.expectError(error.Overflow, parseInto(D, DefaultTypes, a, "{\"n\":99999999999}", .{ .number_mode = .raw }));
+    try testing.expectError(error.TypeMismatch, parseInto(D, TypedCodec(.{}), .local_only, a, "{\"n\":1.5}", .{ .number_mode = .raw }));
+    try testing.expectError(error.TypeMismatch, parseInto(D, TypedCodec(.{}), .local_only, a, "{\"n\":1e2}", .{ .number_mode = .raw }));
+    try testing.expectError(error.Overflow, parseInto(D, TypedCodec(.{}), .local_only, a, "{\"n\":99999999999}", .{ .number_mode = .raw }));
 }
 
 test "decode enum from integer tag" {
@@ -1083,7 +1186,7 @@ test "decode enum from integer tag" {
     const C = struct { level: Level };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"level\":2}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"level\":2}", .{});
     try testing.expectEqual(Level.warn, c.level);
 }
 
@@ -1092,21 +1195,21 @@ test "decode enum from out-of-range integer is error" {
     const C = struct { level: Level };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.InvalidEnumValue, parseInto(C, DefaultTypes, ar.allocator(), "{\"level\":99}", .{}));
+    try testing.expectError(error.InvalidEnumValue, parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"level\":99}", .{}));
 }
 
 test "decode enum from invalid string is error" {
     const C = struct { mode: enum { fast, slow } };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.InvalidEnumValue, parseInto(C, DefaultTypes, ar.allocator(), "{\"mode\":\"warp\"}", .{}));
+    try testing.expectError(error.InvalidEnumValue, parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"mode\":\"warp\"}", .{}));
 }
 
 test "decode missing required field is error" {
     const C = struct { required: []const u8 };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.MissingField, parseInto(C, DefaultTypes, ar.allocator(), "{}", .{}));
+    try testing.expectError(error.MissingField, parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{}", .{}));
 }
 
 test "decode fixed-size array and length mismatch" {
@@ -1114,10 +1217,10 @@ test "decode fixed-size array and length mismatch" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const c = try parseInto(C, DefaultTypes, a, "{\"rgb\":[1,2,3]}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, a, "{\"rgb\":[1,2,3]}", .{});
     try testing.expectEqual(@as(u8, 1), c.rgb[0]);
     try testing.expectEqual(@as(u8, 3), c.rgb[2]);
-    try testing.expectError(error.TypeMismatch, parseInto(C, DefaultTypes, a, "{\"rgb\":[1,2]}", .{}));
+    try testing.expectError(error.TypeMismatch, parseInto(C, TypedCodec(.{}), .local_only, a, "{\"rgb\":[1,2]}", .{}));
 }
 
 test "decode nested struct three levels deep" {
@@ -1130,7 +1233,7 @@ test "decode nested struct three levels deep" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"a\":{\"b\":{\"c\":{\"n\":42}}}}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"a\":{\"b\":{\"c\":{\"n\":42}}}}", .{});
     try testing.expectEqual(@as(u32, 42), c.a.b.c.n);
 }
 
@@ -1139,7 +1242,7 @@ test "decode slice of structs" {
     const C = struct { users: []const User };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, ar.allocator(), "{\"users\":[{\"name\":\"alice\",\"age\":30},{\"name\":\"bob\",\"age\":25}]}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"users\":[{\"name\":\"alice\",\"age\":30},{\"name\":\"bob\",\"age\":25}]}", .{});
     try testing.expectEqual(@as(usize, 2), c.users.len);
     try testing.expectEqualStrings("alice", c.users[0].name);
     try testing.expectEqual(@as(u32, 25), c.users[1].age);
@@ -1149,7 +1252,7 @@ test "decode embedded Value field keeps dynamic subtree" {
     const C = struct { meta: Value, n: u32 };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"meta\":{\"a\":[1,2]},\"n\":5}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"meta\":{\"a\":[1,2]},\"n\":5}", .{});
     try testing.expectEqual(@as(u32, 5), c.n);
     try testing.expect(c.meta == .object);
     try testing.expectEqual(@as(i64, 2), c.meta.getT(i64, "a[1]").?);
@@ -1160,10 +1263,10 @@ test "decode raw Value passthrough at any variant" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const c = try parseInto(C, DefaultTypes, a, "{\"anything\":\"goes\"}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, a, "{\"anything\":\"goes\"}", .{});
     try testing.expectEqualStrings("goes", c.anything.string);
     // `null` is a Value variant, so it passes through rather than erroring.
-    const c2 = try parseInto(C, DefaultTypes, a, "{\"anything\":null}", .{});
+    const c2 = try parseInto(C, TypedCodec(.{}), .local_only, a, "{\"anything\":null}", .{});
     try testing.expect(c2.anything == .null);
 }
 
@@ -1189,7 +1292,7 @@ test "decode: fromJson hook short-circuits built-in dispatch" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const C = struct { v: SemVer };
-    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"v\":\"1.2.3\"}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"v\":\"1.2.3\"}", .{});
     try testing.expectEqual(@as(u32, 1), c.v.major);
     try testing.expectEqual(@as(u32, 2), c.v.minor);
     try testing.expectEqual(@as(u32, 3), c.v.patch);
@@ -1203,7 +1306,7 @@ test "decode: json_rename unknown-field check uses renamed name" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     // Original snake_case key -- should error since renamed key is expected.
-    try testing.expectError(error.UnknownField, parseInto(C, DefaultTypes, ar.allocator(), "{\"listen_addr\":\"0.0.0.0\"}", .{}));
+    try testing.expectError(error.UnknownField, parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"listen_addr\":\"0.0.0.0\"}", .{}));
 }
 
 test "decode: json_skip rejects skipped key in strict mode" {
@@ -1216,7 +1319,7 @@ test "decode: json_skip rejects skipped key in strict mode" {
     defer ar.deinit();
     // Skipped fields are excluded from the expected-keys set,
     // so a JSON key matching a skipped field is "unknown".
-    try testing.expectError(error.UnknownField, parseInto(C, DefaultTypes, ar.allocator(), "{\"name\":\"foo\",\"internal\":99}", .{}));
+    try testing.expectError(error.UnknownField, parseInto(C, TypedCodec(.{}), .local_only, ar.allocator(), "{\"name\":\"foo\",\"internal\":99}", .{}));
 }
 
 test "decode: json_flatten inner json_rename expands into expected keys" {
@@ -1232,7 +1335,7 @@ test "decode: json_flatten inner json_rename expands into expected keys" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(Outer, ar.allocator(), "{\"listen-addr\":\"x\",\"log-level\":\"debug\"}", .{});
+    const c = try parseInto(Outer, TypedCodec(.{}), .local_only, ar.allocator(), "{\"listen-addr\":\"x\",\"log-level\":\"debug\"}", .{});
     try testing.expectEqualStrings("x", c.listen_addr);
     try testing.expectEqualStrings("debug", c.inner.log_level);
 }
@@ -1246,7 +1349,7 @@ test "decode: json_flatten unknown-field check expands flattened keys" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.UnknownField, parseInto(Outer, ar.allocator(), "{\"name\":\"foo\",\"x\":42,\"unexpected\":true}", .{}));
+    try testing.expectError(error.UnknownField, parseInto(Outer, TypedCodec(.{}), .local_only, ar.allocator(), "{\"name\":\"foo\",\"x\":42,\"unexpected\":true}", .{}));
 }
 
 test "decode: tagged union missing discriminator -> MissingField" {
@@ -1256,7 +1359,7 @@ test "decode: tagged union missing discriminator -> MissingField" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.MissingField, parseInto(Plugin, DefaultTypes, ar.allocator(), "{\"host\":\"localhost\"}", .{}));
+    try testing.expectError(error.MissingField, parseInto(Plugin, TypedCodec(.{}), .local_only, ar.allocator(), "{\"host\":\"localhost\"}", .{}));
 }
 
 test "decode: tagged union unknown discriminator -> InvalidEnumValue" {
@@ -1266,7 +1369,7 @@ test "decode: tagged union unknown discriminator -> InvalidEnumValue" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.InvalidEnumValue, parseInto(Plugin, ar.allocator(), "{\"kind\":\"xyz\",\"host\":\"localhost\"}", .{}));
+    try testing.expectError(error.InvalidEnumValue, parseInto(Plugin, TypedCodec(.{}), .local_only, ar.allocator(), "{\"kind\":\"xyz\",\"host\":\"localhost\"}", .{}));
 }
 
 test "decode: tagged union unknown variant diagnostic suggests closest match" {
@@ -1281,7 +1384,7 @@ test "decode: tagged union unknown variant diagnostic suggests closest match" {
     var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
     defer errs.deinit(a);
 
-    _ = parseInto(Plugin, DefaultTypes, a, "{\"kind\":\"htpp\"}", .{ .errors = &errs }) catch {};
+    _ = parseInto(Plugin, TypedCodec(.{}), .local_only, a, "{\"kind\":\"htpp\"}", .{ .errors = &errs }) catch {};
     try testing.expect(errs.items.len == 1);
     try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "unknown variant `htpp`") != null);
     try testing.expectEqualStrings("http", errs.items[0].suggestion.?);
@@ -1298,7 +1401,7 @@ test "decode: tagged union missing discriminator diagnostic names tag field" {
     var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
     defer errs.deinit(a);
 
-    _ = parseInto(Plugin, DefaultTypes, a, "{\"port\":80}", .{ .errors = &errs }) catch {};
+    _ = parseInto(Plugin, TypedCodec(.{}), .local_only, a, "{\"port\":80}", .{ .errors = &errs }) catch {};
     try testing.expect(errs.items.len == 1);
     try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "missing discriminator field `kind`") != null);
 }
@@ -1314,7 +1417,7 @@ test "decode: missing-field diagnostic reports the JSON wire key" {
     var errs: std.ArrayList(parser_mod.Diagnostic) = .empty;
     defer errs.deinit(a);
 
-    _ = parseInto(C, DefaultTypes, a, "{}", .{ .errors = &errs }) catch {};
+    _ = parseInto(C, TypedCodec(.{}), .local_only, a, "{}", .{ .errors = &errs }) catch {};
     try testing.expect(errs.items.len == 1);
     try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "`listen-addr`") != null);
     try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "listen_addr") == null);
@@ -1328,13 +1431,73 @@ test "decode: tagged union void variant" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const p_ = try parseInto(Plugin, DefaultTypes, ar.allocator(), "{\"kind\":\"none\"}", .{});
+    const p_ = try parseInto(Plugin, TypedCodec(.{}), .local_only, ar.allocator(), "{\"kind\":\"none\"}", .{});
     try testing.expect(p_ == .none);
 }
 
-// A union without `json_tag` has no JSON shape to dispatch on, so it is
-// rejected at compile time ("json decode: unsupported type"). Not
-// runtime-testable; this mirrors the reference behavior.
+test "decode: tagged union struct payload " {
+    const Component = union(enum) {
+        pub const json_tag = "@kind";
+        pub const json_payload = "@payload";
+
+        AttackComparison: struct { ComparisonOperator: bool, AttackValue: u8 },
+        Subset: []const u8,
+        None: void,
+    };
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    const src = "{\"@kind\":\"AttackComparison\",\"@payload\":{\"ComparisonOperator\":true,\"AttackValue\":15}}";
+    const c = try parseInto(Component, TypedCodec(.{}), .local_only, a, src, .{});
+    try testing.expectEqual(true, c.AttackComparison.ComparisonOperator);
+    try testing.expectEqual(@as(u8, 15), c.AttackComparison.AttackValue);
+}
+
+test "decode: tagged union scalar payload " {
+    const Component = union(enum) {
+        pub const json_tag = "@kind";
+        pub const json_payload = "@payload";
+
+        AttackComparison: struct { ComparisonOperator: bool, AttackValue: u8 },
+        Subset: []const u8,
+        None: void,
+    };
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    const src = "{\"@kind\":\"Subset\",\"@payload\":\"base\"}";
+    const c = try parseInto(Component, TypedCodec(.{}), .local_only, a, src, .{});
+    try testing.expectEqualStrings("base", c.Subset);
+}
+
+test "decode: tagged union void payload " {
+    const Component = union(enum) {
+        pub const json_tag = "@kind";
+        pub const json_payload = "@payload";
+
+        AttackComparison: struct { ComparisonOperator: bool, AttackValue: u8 },
+        Subset: []const u8,
+        None: void,
+    };
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+
+    const src = "{\"@kind\":\"None\"}";
+    const c = try parseInto(Component, TypedCodec(.{}), .local_only, a, src, .{});
+    _ = c;
+}
 
 test "decode: unknown field suggests closest match" {
     var ar = ArenaAllocator.init(testing.allocator);
@@ -1346,7 +1509,7 @@ test "decode: unknown field suggests closest match" {
     // `prt` is a typo for `port`; `port` is also present so the required
     // field is satisfied and the unknown-field check runs.
     const C = struct { port: u16 };
-    _ = parseInto(C, DefaultTypes, a, "{\"port\":8080,\"prt\":9090}", .{ .errors = &errs }) catch {};
+    _ = parseInto(C, TypedCodec(.{}), .local_only, a, "{\"port\":8080,\"prt\":9090}", .{ .errors = &errs }) catch {};
 
     try testing.expect(errs.items.len == 1);
     try testing.expect(errs.items[0].suggestion != null);
@@ -1363,7 +1526,7 @@ test "decode: nested type mismatch reports dotted path in message" {
     const C = struct {
         server: struct { port: u16 },
     };
-    _ = parseInto(C, DefaultTypes, a, "{\"server\":{\"port\":\"8080\"}}", .{ .errors = &errs }) catch {};
+    _ = parseInto(C, TypedCodec(.{}), .local_only, a, "{\"server\":{\"port\":\"8080\"}}", .{ .errors = &errs }) catch {};
 
     try testing.expect(errs.items.len == 1);
     try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "server.port") != null);
@@ -1401,7 +1564,7 @@ test "decode operates on an already-parsed Value" {
         port: u16,
         enabled: bool,
     };
-    const cfg = try decode(Config, DefaultTypes, a, v, .{});
+    const cfg = try decode(Config, TypedCodec(.{}), .local_only, a, v, .{});
     try testing.expectEqualStrings("json", cfg.title);
     try testing.expectEqual(@as(u16, 8080), cfg.port);
     try testing.expectEqual(true, cfg.enabled);
@@ -1417,10 +1580,10 @@ test "wide-int round-trip: u64 max via encodeTyped -> parseInto" {
     const orig: S = .{ .n = std.math.maxInt(u64) };
     var aw: std.Io.Writer.Allocating = .init(a);
     defer aw.deinit();
-    try encoder_mod.encodeTyped(&aw.writer, orig, DefaultTypes, a, .{});
+    try encoder_mod.encodeTyped(TypedCodec(.{}), .local_only, &aw.writer, orig, a, .{});
     // "18446744073709551615" must appear verbatim in the encoded output.
     try testing.expect(std.mem.indexOf(u8, aw.written(), "18446744073709551615") != null);
-    const back = try parseInto(S, DefaultTypes, a, aw.written(), .{});
+    const back = try parseInto(S, TypedCodec(.{}), .local_only, a, aw.written(), .{});
     try testing.expectEqual(std.math.maxInt(u64), back.n);
 }
 
@@ -1429,9 +1592,9 @@ test "wide-int round-trip: i128 extremes via number_mode=.raw" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const back_max = try parseInto(S, DefaultTypes, a, "{\"n\":170141183460469231731687303715884105727}", .{ .number_mode = .raw });
+    const back_max = try parseInto(S, TypedCodec(.{}), .local_only, a, "{\"n\":170141183460469231731687303715884105727}", .{ .number_mode = .raw });
     try testing.expectEqual(std.math.maxInt(i128), back_max.n);
-    const back_min = try parseInto(S, DefaultTypes, a, "{\"n\":-170141183460469231731687303715884105728}", .{ .number_mode = .raw });
+    const back_min = try parseInto(S, TypedCodec(.{}), .local_only, a, "{\"n\":-170141183460469231731687303715884105728}", .{ .number_mode = .raw });
     try testing.expectEqual(std.math.minInt(i128), back_min.n);
 }
 
@@ -1440,7 +1603,7 @@ test "wide-int round-trip: u128 max via number_mode=.raw" {
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const back = try parseInto(S, DefaultTypes, a, "{\"n\":340282366920938463463374607431768211455}", .{ .number_mode = .raw });
+    const back = try parseInto(S, TypedCodec(.{}), .local_only, a, "{\"n\":340282366920938463463374607431768211455}", .{ .number_mode = .raw });
     try testing.expectEqual(std.math.maxInt(u128), back.n);
 }
 
@@ -1460,7 +1623,7 @@ test "wide-int control: i64 min and small int still work" {
     defer ar.deinit();
     const a = ar.allocator();
     const S = struct { a: i64, b: i32 };
-    const c = try parseInto(S, DefaultTypes, a, "{\"a\":-9223372036854775808,\"b\":7}", .{});
+    const c = try parseInto(S, TypedCodec(.{}), .local_only, a, "{\"a\":-9223372036854775808,\"b\":7}", .{});
     try testing.expectEqual(std.math.minInt(i64), c.a);
     try testing.expectEqual(@as(i32, 7), c.b);
 }
@@ -1472,20 +1635,20 @@ test "decode float narrowing overflow is Overflow" {
 
     const C32 = struct { x: f32 };
     // 1e40 is finite as f64 but overflows f32 (~3.4e38 max).
-    try testing.expectError(error.Overflow, parseInto(C32, DefaultTypes, a, "{\"x\":1e40}", .{}));
+    try testing.expectError(error.Overflow, parseInto(C32, TypedCodec(.{}), .local_only, a, "{\"x\":1e40}", .{}));
     // 3.5e38 is a float literal (stored as .float) that overflows f32.
-    try testing.expectError(error.Overflow, parseInto(C32, DefaultTypes, a, "{\"x\":3.5e38}", .{}));
+    try testing.expectError(error.Overflow, parseInto(C32, TypedCodec(.{}), .local_only, a, "{\"x\":3.5e38}", .{}));
     // 3.0e38 is within f32 range -- must succeed.
-    const c = try parseInto(C32, DefaultTypes, a, "{\"x\":3.0e38}", .{});
+    const c = try parseInto(C32, TypedCodec(.{}), .local_only, a, "{\"x\":3.0e38}", .{});
     try testing.expect(!std.math.isInf(c.x));
 
     // Integer 66000 overflows f16 (max 65504) via @floatFromInt.
     const C16 = struct { x: f16 };
-    try testing.expectError(error.Overflow, parseInto(C16, DefaultTypes, a, "{\"x\":66000}", .{}));
+    try testing.expectError(error.Overflow, parseInto(C16, TypedCodec(.{}), .local_only, a, "{\"x\":66000}", .{}));
 
     // f64 target with 1e40 -- no narrowing, finite result passes through.
     const C64 = struct { x: f64 };
-    const c64 = try parseInto(C64, DefaultTypes, a, "{\"x\":1e40}", .{});
+    const c64 = try parseInto(C64, TypedCodec(.{}), .local_only, a, "{\"x\":1e40}", .{});
     try testing.expect(!std.math.isInf(c64.x));
 }
 
@@ -1495,11 +1658,11 @@ test "decode zero-length fixed array field compiles and decodes" {
     defer ar.deinit();
     const a = ar.allocator();
     // Empty JSON array for [0]u8 field must compile and decode successfully.
-    const c = try parseInto(C, DefaultTypes, a, "{\"xs\":[],\"name\":\"ok\"}", .{});
+    const c = try parseInto(C, TypedCodec(.{}), .local_only, a, "{\"xs\":[],\"name\":\"ok\"}", .{});
     try testing.expectEqual([0]u8{}, c.xs);
     try testing.expectEqualStrings("ok", c.name);
     // Non-empty JSON array for [0]u8 field must be TypeMismatch (length mismatch).
-    try testing.expectError(error.TypeMismatch, parseInto(C, DefaultTypes, a, "{\"xs\":[1],\"name\":\"ok\"}", .{}));
+    try testing.expectError(error.TypeMismatch, parseInto(C, TypedCodec(.{}), .local_only, a, "{\"xs\":[1],\"name\":\"ok\"}", .{}));
 }
 
 test "wide-int Document.set u64 max succeeds; u128 above i128 max returns error" {
@@ -1584,14 +1747,14 @@ test "parseInto streams: allocation bounded, no Value tree materialized" {
     defer ar.deinit();
     var counting: CountingAllocator = .{ .child = ar.allocator() };
 
-    const out = try parseInto([]const Rec, DefaultTypes, counting.allocator(), src.items, .{});
+    const out = try parseInto([]const Rec, TypedCodec(.{}), .local_only, counting.allocator(), src.items, .{});
     try testing.expectEqual(@as(usize, 2000), out.len);
     try testing.expectEqualStrings("record-1999", out[1999].name);
 
     var tree_arena = ArenaAllocator.init(testing.allocator);
     defer tree_arena.deinit();
     var tree_counting: CountingAllocator = .{ .child = tree_arena.allocator() };
-    const tree_out = try parseIntoTree([]const Rec, DefaultTypes, tree_counting.allocator(), src.items, .{});
+    const tree_out = try parseIntoTree([]const Rec, TypedCodec(.{}), .local_only, tree_counting.allocator(), src.items, .{});
     try testing.expectEqual(@as(usize, 2000), tree_out.len);
 
     // The streaming path allocates the decoded output plus list-growth
@@ -1611,7 +1774,7 @@ test "streaming equivalence: duplicate key with invalid first occurrence decodes
     const T = struct { a: u32 };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const v = try parseInto(T, DefaultTypes, ar.allocator(), "{\"a\":\"not an int\",\"a\":7}", .{});
+    const v = try parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), "{\"a\":\"not an int\",\"a\":7}", .{});
     try testing.expectEqual(@as(u32, 7), v.a);
 }
 
@@ -1622,14 +1785,14 @@ test "streaming equivalence: unknown field wins over earlier type error" {
     const T = struct { a: u32 };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.UnknownField, parseInto(T, DefaultTypes, ar.allocator(), "{\"a\":\"bad\",\"zzz\":1}", .{}));
+    try testing.expectError(error.UnknownField, parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), "{\"a\":\"bad\",\"zzz\":1}", .{}));
 }
 
 test "streaming: jsonc comments and trailing commas decode typed" {
     const T = struct { a: u32, tags: []const []const u8 };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const v = try parseInto(T, DefaultTypes, ar.allocator(),
+    const v = try parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(),
         \\{
         \\  // comment
         \\  "a": 3,
@@ -1644,7 +1807,7 @@ test "streaming: escaped object key matches field" {
     const T = struct { name: u32 };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const v = try parseInto(T, DefaultTypes, ar.allocator(), "{\"na\\u006de\":5}", .{});
+    const v = try parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), "{\"na\\u006de\":5}", .{});
     try testing.expectEqual(@as(u32, 5), v.name);
 }
 
@@ -1658,7 +1821,7 @@ test "streaming: deep nesting inside ignored unknown field is depth-bounded" {
     try src.appendNTimes(testing.allocator, '[', 200);
     try src.appendNTimes(testing.allocator, ']', 200);
     try src.appendSlice(testing.allocator, "}");
-    try testing.expectError(error.NestingTooDeep, parseInto(T, DefaultTypes, ar.allocator(), src.items, .{ .ignore_unknown_fields = true }));
+    try testing.expectError(error.NestingTooDeep, parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), src.items, .{ .ignore_unknown_fields = true }));
 }
 
 test "streaming: u128 beyond i128 range errors typed, decodes raw" {
@@ -1668,9 +1831,9 @@ test "streaming: u128 beyond i128 range errors typed, decodes raw" {
     const big = "{\"n\":200000000000000000000000000000000000000}";
     // Typed mode: the tree stores integers as i128 (overflow falls back to
     // float), so the streaming pass must not sneak a wider direct parse in.
-    try testing.expectError(error.TypeMismatch, parseInto(T, DefaultTypes, ar.allocator(), big, .{}));
+    try testing.expectError(error.TypeMismatch, parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), big, .{}));
     // Raw mode: the verbatim lexeme decodes straight into u128, both paths.
-    const v = try parseInto(T, DefaultTypes, ar.allocator(), big, .{ .number_mode = .raw });
+    const v = try parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), big, .{ .number_mode = .raw });
     try testing.expectEqual(@as(u128, 200000000000000000000000000000000000000), v.n);
 }
 
@@ -1690,13 +1853,13 @@ test "streaming: flatten inside flatten decodes from one object" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const v = try parseInto(T, DefaultTypes, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3}", .{});
+    const v = try parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3}", .{});
     try testing.expectEqual(@as(u32, 1), v.x);
     try testing.expectEqual(@as(u32, 2), v.flat.y);
     try testing.expectEqual(@as(u32, 3), v.flat.deep.z);
     try testing.expectEqual(@as(u8, 42), v.skipped);
     // A key unknown to every level is UnknownField, matching expectedKeys.
-    try testing.expectError(error.UnknownField, parseInto(T, DefaultTypes, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3,\"w\":4}", .{}));
+    try testing.expectError(error.UnknownField, parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3,\"w\":4}", .{}));
     // The skipped field's wire name is NOT an expected key.
-    try testing.expectError(error.UnknownField, parseInto(T, DefaultTypes, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3,\"skipped\":9}", .{}));
+    try testing.expectError(error.UnknownField, parseInto(T, TypedCodec(.{}), .local_only, ar.allocator(), "{\"x\":1,\"y\":2,\"z\":3,\"skipped\":9}", .{}));
 }

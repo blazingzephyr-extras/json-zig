@@ -18,7 +18,7 @@ const parser_mod = @import("parser.zig");
 const stream_mod = @import("stream.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const value_mod = @import("value.zig");
-const annotation_mod = @import("annotation.zig");
+const codec_mod = @import("codec.zig");
 
 /// Lossless document model: parse, edit, emit byte-identical when
 /// unmodified. See `src/document.zig`.
@@ -56,12 +56,6 @@ pub const Diagnostic = parser_mod.Diagnostic;
 
 /// All knobs for `parse`. Default is `.{}` (strict JSON, depth 128).
 pub const ParseOptions = parser_mod.ParseOptions;
-
-/// Type annotation. See `src/annotation.zig`.
-pub const TypeAnnotationRename = annotation_mod.TypeAnnotationRename;
-pub const TypeAnnotationProvider = annotation_mod.TypeAnnotationProvider;
-pub const TypeAnnotationOptions = annotation_mod.TypeAnnotationOptions;
-pub const DefaultTypes = annotation_mod.DefaultTypes;
 
 /// Number materialization policy for the dynamic `Value` tree. `.typed`
 /// (default) yields `.integer`/`.float`; `.raw` yields `.number_raw` with
@@ -108,6 +102,15 @@ pub const Spans = value_mod.Spans;
 /// failure path.
 pub const ReaderError = parser_mod.ReaderError;
 
+/// JSON field name override.
+pub const AnnotationRename = codec_mod.AnnotationRename;
+/// Type's external annotation record. See `src/codec.zig`.
+pub const Annotations = codec_mod.Annotations;
+/// Precedence rules for annotations.
+pub const AnnotationsSource = codec_mod.AnnotationsSource;
+/// Annotations container. See `src/codec.zig`.
+pub const TypedCodec = codec_mod.TypedCodec;
+
 /// Parse a JSON (or JSONC) document from a byte slice. All allocations
 /// land in `arena`; free the tree with `arena.deinit()`. Strings may be
 /// zero-copy slices into `src`, so keep `src` alive while the tree is
@@ -135,9 +138,8 @@ pub const DecodeError = decode_mod.DecodeError;
 /// Supports bool, ints (overflow-checked), floats, `[]const u8`,
 /// slices, fixed-size arrays, optionals, nested structs, enums (string
 /// name or integer tag), tagged unions via `json_tag`, embedded `Value`
-/// fields (kept dynamic), custom `fromJson` hooks, the
-/// `json_rename` / `json_skip` / `json_flatten` annotations via
-/// declarations in `T` and `TAnnotation`.
+/// fields (kept dynamic), custom `fromJson` hooks, and the
+/// `json_rename` / `json_skip` / `json_flatten` annotations.
 ///
 /// Number policy: float targets accept `.integer` values, but integer
 /// targets do NOT accept `.float` -- `1e2` parses as `.float` and stays
@@ -147,8 +149,8 @@ pub const DecodeError = decode_mod.DecodeError;
 /// use `number_mode = .raw` so the lexeme decodes directly into the
 /// target. JSON `null` decodes only into optional targets; anywhere else
 /// it errors like an absent field. See `src/decode.zig`.
-pub fn decode(comptime T: type, comptime TAnnotation: type, arena: std.mem.Allocator, value: Value, options: ParseOptions) DecodeError!T {
-    return decode_mod.decode(T, TAnnotation, arena, value, options);
+pub fn decode(comptime T: type, arena: std.mem.Allocator, value: Value, options: ParseOptions) DecodeError!T {
+    return decode_mod.decode(T, TypedCodec(.{}), .local_only, arena, value, options);
 }
 
 /// Decode `src` directly into a `T`. Types without `Value` fields,
@@ -158,14 +160,14 @@ pub fn decode(comptime T: type, comptime TAnnotation: type, arena: std.mem.Alloc
 /// identically. All allocations land in `arena`; string fields may be
 /// zero-copy slices into `src`, so keep `src` alive while the result is
 /// in use.
-pub fn parseInto(comptime T: type, comptime TAnnotation: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) (Error || DecodeError)!T {
-    return decode_mod.parseInto(T, TAnnotation, arena, src, options);
+pub fn parseInto(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) (Error || DecodeError)!T {
+    return decode_mod.parseInto(T, TypedCodec(.{}), .local_only, arena, src, options);
 }
 
 /// Reader-input variant of `parseInto`: drains the reader into arena
 /// memory, then parses and decodes.
-pub fn parseIntoReader(comptime T: type, comptime TAnnotation: type, arena: std.mem.Allocator, reader: *std.Io.Reader, options: ParseOptions) (ReaderError || DecodeError)!T {
-    return decode_mod.parseIntoReader(T, TAnnotation, arena, reader, options);
+pub fn parseIntoReader(comptime T: type, arena: std.mem.Allocator, reader: *std.Io.Reader, options: ParseOptions) (ReaderError || DecodeError)!T {
+    return decode_mod.parseIntoReader(T, TypedCodec(.{}), .local_only, arena, reader, options);
 }
 
 /// Encode failure: writer errors, plus `UnrepresentableFloat` for NaN
@@ -205,8 +207,8 @@ pub fn encode(w: *std.Io.Writer, value: Value, options: EncodeOptions) EncodeErr
 /// Annotations and hooks are read from `@TypeOf(value)`, so bind an
 /// anonymous struct literal to the annotated type before passing it
 /// (an anonymous literal's type carries no declarations).
-pub fn encodeTyped(w: *std.Io.Writer, value: anytype, comptime TAnnotation: type, arena: std.mem.Allocator, options: EncodeOptions) EncodeError!void {
-    return encoder_mod.encodeTyped(w, value, TAnnotation, arena, options);
+pub fn encodeTyped(w: *std.Io.Writer, value: anytype, arena: std.mem.Allocator, options: EncodeOptions) EncodeError!void {
+    return encoder_mod.encodeTyped(TypedCodec(.{}), .local_only, w, value, arena, options);
 }
 
 test "spans recorded per dotted path" {
