@@ -991,7 +991,7 @@ test "json_rename json_skip json_flatten" {
     };
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"listen-addr\":\"x\",\"verbose\":true}", .{});
+    const c = try parseInto(C, ar.allocator(), "{\"listen-addr\":\"x\",\"verbose\":true}", .{});
     try std.testing.expectEqualStrings("x", c.listen_addr);
     try std.testing.expectEqual(@as(u32, 7), c.runtime);
     try std.testing.expectEqual(true, c.common.verbose);
@@ -1139,7 +1139,7 @@ test "decode slice of structs" {
     const C = struct { users: []const User };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(C, DefaultTypes, ar.allocator(), "{\"users\":[{\"name\":\"alice\",\"age\":30},{\"name\":\"bob\",\"age\":25}]}", .{});
+    const c = try parseInto(C, ar.allocator(), "{\"users\":[{\"name\":\"alice\",\"age\":30},{\"name\":\"bob\",\"age\":25}]}", .{});
     try testing.expectEqual(@as(usize, 2), c.users.len);
     try testing.expectEqualStrings("alice", c.users[0].name);
     try testing.expectEqual(@as(u32, 25), c.users[1].age);
@@ -1232,7 +1232,7 @@ test "decode: json_flatten inner json_rename expands into expected keys" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    const c = try parseInto(Outer, DefaultTypes, ar.allocator(), "{\"listen-addr\":\"x\",\"log-level\":\"debug\"}", .{});
+    const c = try parseInto(Outer, ar.allocator(), "{\"listen-addr\":\"x\",\"log-level\":\"debug\"}", .{});
     try testing.expectEqualStrings("x", c.listen_addr);
     try testing.expectEqualStrings("debug", c.inner.log_level);
 }
@@ -1246,7 +1246,7 @@ test "decode: json_flatten unknown-field check expands flattened keys" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.UnknownField, parseInto(Outer, DefaultTypes, ar.allocator(), "{\"name\":\"foo\",\"x\":42,\"unexpected\":true}", .{}));
+    try testing.expectError(error.UnknownField, parseInto(Outer, ar.allocator(), "{\"name\":\"foo\",\"x\":42,\"unexpected\":true}", .{}));
 }
 
 test "decode: tagged union missing discriminator -> MissingField" {
@@ -1266,7 +1266,7 @@ test "decode: tagged union unknown discriminator -> InvalidEnumValue" {
     };
     var ar = ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
-    try testing.expectError(error.InvalidEnumValue, parseInto(Plugin, DefaultTypes, ar.allocator(), "{\"kind\":\"xyz\",\"host\":\"localhost\"}", .{}));
+    try testing.expectError(error.InvalidEnumValue, parseInto(Plugin, ar.allocator(), "{\"kind\":\"xyz\",\"host\":\"localhost\"}", .{}));
 }
 
 test "decode: tagged union unknown variant diagnostic suggests closest match" {
